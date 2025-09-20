@@ -1,6 +1,7 @@
 import boto3
 import json
 import time
+import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import folium
@@ -53,8 +54,8 @@ class DynamicRouteOptimizer:
         response = self.vehicles_table.scan(Limit=3)
         return response['Items']
     
-    def assign_requests_to_vehicles(self, requests: List[Dict], vehicles: List[Dict]) -> Dict[str, List[Dict]]:
-        """Assign ALL requests to vehicles considering time constraints"""
+    def assign_requests_to_vehicles(self, requests: List[Dict], vehicles: List[Dict], max_wait_minutes: int = 15, max_travel_minutes: int = 45) -> Dict[str, List[Dict]]:
+        """Assign ALL requests to vehicles considering time and travel duration constraints"""
         assignments = {vehicle['vehicleId']: [] for vehicle in vehicles}
         
         # Sort requests by pickup time
@@ -80,8 +81,12 @@ class DynamicRouteOptimizer:
                 if len(current_requests) >= vehicle.get('capacity', 20):
                     continue
                 
-                # Relaxed time constraint - allow 30 minutes instead of 15
-                if self._violates_waiting_time(request, current_requests, max_wait_minutes=30):
+                # Dynamic time constraint
+                if self._violates_waiting_time(request, current_requests, max_wait_minutes=max_wait_minutes):
+                    continue
+                
+                # Check travel duration constraint
+                if self._violates_travel_duration(request, current_requests, max_travel_minutes=max_travel_minutes):
                     continue
                 
                 cost = self._calculate_assignment_cost(request, vehicle, current_requests)
@@ -114,6 +119,20 @@ class DynamicRouteOptimizer:
             if time_diff > (max_wait_minutes * 60):
                 return True
         return False
+    
+    def _violates_travel_duration(self, request: Dict, current_requests: List[Dict], max_travel_minutes: int = 15) -> bool:
+        """Check if adding request would exceed maximum travel duration"""
+        if not current_requests:
+            return False
+        
+        # Estimate total route duration with new request
+        all_requests = current_requests + [request]
+        total_stops = len(all_requests) * 2  # pickup + dropoff for each
+        
+        # Simple heuristic: average 3 minutes per stop
+        estimated_duration = total_stops * 3
+        
+        return estimated_duration > max_travel_minutes
     
     def _calculate_assignment_cost(self, request: Dict, vehicle: Dict, current_requests: List[Dict]) -> float:
         """Calculate cost of assigning request to vehicle"""
@@ -197,13 +216,28 @@ class DynamicRouteOptimizer:
                 IncludeLegGeometry=True
             )
             
+            # Debug: Print response structure
+            print(f"Route response keys: {response.keys()}")
+            if 'Legs' in response and response['Legs']:
+                print(f"First leg keys: {response['Legs'][0].keys()}")
+                if 'Geometry' in response['Legs'][0]:
+                    print(f"Geometry keys: {response['Legs'][0]['Geometry'].keys()}")
+            
+            # Add cumulative duration to sequence stops
+            legs = response.get('Legs', [])
+            cumulative_duration = 0
+            for i, stop in enumerate(sequence):
+                if i < len(legs):
+                    cumulative_duration += legs[i].get('DurationSeconds', 0)
+                stop['cumulative_duration'] = cumulative_duration
+            
             return {
                 'route': response['Legs'],
                 'distance': response['Summary']['Distance'],
                 'duration': response['Summary']['DurationSeconds'],
                 'waypoints': waypoints,
                 'sequence': sequence,
-                'geometry': response.get('Legs', [])
+                'geometry': response.get('Legs', [])  # Contains actual road geometry
             }
         except Exception as e:
             print(f"Route optimization failed: {e}")
@@ -211,13 +245,19 @@ class DynamicRouteOptimizer:
     
     def create_route_map(self, assignments: Dict[str, List[Dict]], routes: Dict[str, Dict]) -> str:
         """Create interactive map with routes"""
-        # Center map on first vehicle or default location
-        center_lat, center_lon = 39.7491, -8.8118
-        
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
-        map_var = f"map_{int(time.time())}"
-        
-        colors = ['red', 'blue', 'green', 'purple', 'orange']
+        try:
+            print("Starting map creation...")
+            # Center map on first vehicle or default location
+            center_lat, center_lon = 39.7491, -8.8118
+            
+            m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+            map_var = f"map_{int(time.time())}"
+            
+            colors = ['red', 'blue', 'green', 'purple', 'orange']
+            print(f"Created base map centered at {center_lat}, {center_lon}")
+        except Exception as e:
+            print(f"Error creating base map: {e}")
+            raise
         
         for i, (vehicle_id, vehicle_requests) in enumerate(assignments.items()):
             if not vehicle_requests:
@@ -235,15 +275,42 @@ class DynamicRouteOptimizer:
                     icon=folium.Icon(color=color, icon='car', prefix='fa')
                 ).add_to(m)
             
-            # Add route line
-            if len(waypoints) > 1:
+            # Add route line using actual road geometry
+            route_data = routes.get(vehicle_id, {})
+            geometry_found = False
+            
+            if route_data.get('geometry'):
+                # Use actual route geometry from Amazon Location Service
+                for leg in route_data['geometry']:
+                    if 'Geometry' in leg:
+                        geometry = leg['Geometry']
+                        if 'LineString' in geometry:
+                            # Convert Amazon Location coordinates to Leaflet format
+                            route_coords = [[coord[1], coord[0]] for coord in geometry['LineString']]
+                            folium.PolyLine(
+                                route_coords,
+                                color=color,
+                                weight=4,
+                                opacity=0.8,
+                                popup=f"Vehicle {vehicle_id} Route - {leg.get('Distance', 0):.1f}km"
+                            ).add_to(m)
+                            geometry_found = True
+                        else:
+                            print(f"No LineString in geometry: {geometry.keys()}")
+                    else:
+                        print(f"No Geometry in leg: {leg.keys()}")
+            
+            if not geometry_found and len(waypoints) > 1:
+                # Fallback to straight lines if no geometry available
+                print(f"Using fallback straight lines for vehicle {vehicle_id}")
                 route_coords = [[wp[1], wp[0]] for wp in waypoints]
                 folium.PolyLine(
                     route_coords,
                     color=color,
                     weight=3,
-                    opacity=0.8,
-                    popup=f"Vehicle {vehicle_id} Route"
+                    opacity=0.5,
+                    popup=f"Vehicle {vehicle_id} Route (Direct)",
+                    dashArray='5, 5'
                 ).add_to(m)
             
             # Use optimized sequence from route data
@@ -282,7 +349,8 @@ class DynamicRouteOptimizer:
                     if dropoff_stops:
                         popup_content += "<b>DROPOFFS:</b><br>"
                         for stop in dropoff_stops:
-                            popup_content += f"• Request {stop['requestId']}<br>"
+                            duration_mins = stop.get('cumulative_duration', 0) // 60
+                            popup_content += f"• Request {stop['requestId']} - Trip: {duration_mins}min<br>"
                     
                     popup_content += f"Stop ID: {stops[0]['stopId']}"
                     
@@ -317,6 +385,10 @@ class DynamicRouteOptimizer:
         <input type="datetime-local" id="startTime" style="width:100%; margin:5px 0;"><br>
         <label>End Time:</label><br>
         <input type="datetime-local" id="endTime" style="width:100%; margin:5px 0;"><br>
+        <label>Max Waiting Time (minutes):</label><br>
+        <input type="number" id="maxWaitTime" value="15" min="5" max="120" style="width:100%; margin:5px 0;"><br>
+        <label>Max Travel Duration (minutes):</label><br>
+        <input type="number" id="maxTravelTime" value="45" min="15" max="180" style="width:100%; margin:5px 0;"><br>
         <button onclick="filterRoutes()" style="width:100%; padding:5px; background:#007cba; color:white; border:none; cursor:pointer;">Filter Routes</button>
         <button onclick="clearFilter()" style="width:100%; padding:5px; margin-top:5px; background:#666; color:white; border:none; cursor:pointer;">Show All</button>
         <div id="filterStatus" style="margin-top:10px; font-size:11px; color:#666;">Showing all routes</div>
@@ -326,11 +398,13 @@ class DynamicRouteOptimizer:
         function filterRoutes() {{
             const start = document.getElementById('startTime').value;
             const end = document.getElementById('endTime').value;
+            const maxWait = document.getElementById('maxWaitTime').value;
+            const maxTravel = document.getElementById('maxTravelTime').value;
             if (start && end) {{
                 const startFormatted = start.replace('T', ' ');
                 const endFormatted = end.replace('T', ' ');
                 document.getElementById('filterStatus').innerHTML = 'Filtering routes...';
-                window.location.href = `/filter?start=${{startFormatted}}&end=${{endFormatted}}`;
+                window.location.href = `/filter?start=${{startFormatted}}&end=${{endFormatted}}&maxwait=${{maxWait}}&maxtravel=${{maxTravel}}`;
             }} else {{
                 alert('Please select both start and end times');
             }}
@@ -339,6 +413,8 @@ class DynamicRouteOptimizer:
         function clearFilter() {{
             document.getElementById('startTime').value = '';
             document.getElementById('endTime').value = '';
+            document.getElementById('maxWaitTime').value = '15';
+            document.getElementById('maxTravelTime').value = '45';
             document.getElementById('filterStatus').innerHTML = 'Showing all routes';
             window.location.href = '/';
         }}
@@ -381,14 +457,43 @@ class DynamicRouteOptimizer:
         '''
         
         # Replace placeholder in filter_html with actual map variable
-        filter_html = filter_html.replace(f"map_{int(time.time())}", map_var)
-        m.get_root().html.add_child(folium.Element(filter_html))
-        m.get_root().html.add_child(folium.Element(info_html))
-        m.get_root().html.add_child(folium.Element(legend_html))
+        try:
+            filter_html = filter_html.replace(f"map_{int(time.time())}", map_var)
+            m.get_root().html.add_child(folium.Element(filter_html))
+            m.get_root().html.add_child(folium.Element(info_html))
+            m.get_root().html.add_child(folium.Element(legend_html))
+            print("Successfully added HTML elements to map")
+        except Exception as e:
+            print(f"Error adding HTML elements to map: {e}")
+            raise
         
-        map_file = f"route_map_{int(time.time())}.html"
-        m.save(map_file)
-        return map_file
+        try:
+            map_file = f"route_map_{int(time.time())}.html"
+            m.save(map_file)
+            print(f"Successfully saved map to {map_file}")
+            
+            # Verify file was created and has content
+            if os.path.exists(map_file):
+                file_size = os.path.getsize(map_file)
+                print(f"Map file size: {file_size} bytes")
+                if file_size == 0:
+                    print("Warning: Map file is empty")
+            else:
+                print(f"Error: Map file {map_file} was not created")
+                return None
+                
+            return map_file
+        except Exception as e:
+            print(f"Error saving map file: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+        except Exception as e:
+            print(f"Error in create_route_map: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def get_stop_coords(self, stop_id: str) -> Optional[List[float]]:
         """Get coordinates for stop ID"""
@@ -408,51 +513,101 @@ class DynamicRouteOptimizer:
         """Calculate distance between two points"""
         return ((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)**0.5
     
-    def run_optimization(self, start_datetime: str = None, end_datetime: str = None):
-        """Main optimization process with optional datetime filter"""
-        print("Starting route optimization...")
-        
-        # Convert datetime strings to datetime objects if provided
-        start_time = None
-        end_time = None
-        if start_datetime:
-            start_time = datetime.strptime(start_datetime, '%Y-%m-%d %H:%M')
-        if end_datetime:
-            end_time = datetime.strptime(end_datetime, '%Y-%m-%d %H:%M')
-        
-        if start_time and end_time:
-            print(f"Filtering requests from {start_datetime} to {end_datetime}")
-        
-        # Get data from DynamoDB
-        requests = self.get_requests(start_time, end_time)
-        vehicles = self.get_vehicles()
-        
-        print(f"Found {len(requests)} requests and {len(vehicles)} vehicles")
-        
-        if not requests:
-            print("No requests found!")
-            return {}, {}, None
+    def run_optimization(self, start_datetime: str = None, end_datetime: str = None, max_wait_minutes: int = 15, max_travel_minutes: int = 45):
+        """Main optimization process with optional datetime filter, waiting time and travel duration"""
+        try:
+            print("Starting route optimization...")
             
-        if not vehicles:
-            print("No vehicles found!")
+            # Convert datetime strings to datetime objects if provided
+            start_time = None
+            end_time = None
+            if start_datetime:
+                try:
+                    start_time = datetime.strptime(start_datetime, '%Y-%m-%d %H:%M')
+                except ValueError as e:
+                    print(f"Error parsing start datetime '{start_datetime}': {e}")
+                    return {}, {}, None
+            if end_datetime:
+                try:
+                    end_time = datetime.strptime(end_datetime, '%Y-%m-%d %H:%M')
+                except ValueError as e:
+                    print(f"Error parsing end datetime '{end_datetime}': {e}")
+                    return {}, {}, None
+            
+            if start_time and end_time:
+                print(f"Filtering requests from {start_datetime} to {end_datetime}")
+            
+            print(f"Using max waiting time: {max_wait_minutes} minutes")
+            print(f"Using max travel duration: {max_travel_minutes} minutes")
+            
+            # Get data from DynamoDB
+            try:
+                requests = self.get_requests(start_time, end_time)
+                print(f"Successfully retrieved {len(requests)} requests")
+            except Exception as e:
+                print(f"Error retrieving requests from DynamoDB: {e}")
+                return {}, {}, None
+            
+            try:
+                vehicles = self.get_vehicles()
+                print(f"Successfully retrieved {len(vehicles)} vehicles")
+            except Exception as e:
+                print(f"Error retrieving vehicles from DynamoDB: {e}")
+                return {}, {}, None
+            
+            if not requests:
+                print("No requests found!")
+                return {}, {}, None
+                
+            if not vehicles:
+                print("No vehicles found!")
+                return {}, {}, None
+            
+            # Assign requests to vehicles
+            try:
+                assignments = self.assign_requests_to_vehicles(requests, vehicles, max_wait_minutes, max_travel_minutes)
+                print(f"Successfully assigned requests to vehicles")
+            except Exception as e:
+                print(f"Error assigning requests to vehicles: {e}")
+                return {}, {}, None
+            
+            # Optimize routes for each vehicle
+            routes = {}
+            for vehicle_id, vehicle_requests in assignments.items():
+                if vehicle_requests:
+                    try:
+                        routes[vehicle_id] = self.optimize_route_with_location_service(vehicle_id, vehicle_requests)
+                        print(f"Successfully optimized route for vehicle {vehicle_id}")
+                    except Exception as e:
+                        print(f"Error optimizing route for vehicle {vehicle_id}: {e}")
+                        routes[vehicle_id] = {'route': [], 'distance': 0, 'duration': 0}
+            
+            # Create map
+            try:
+                map_file = self.create_route_map(assignments, routes)
+                if map_file:
+                    print(f"Successfully created map file: {map_file}")
+                else:
+                    print("Map creation returned None")
+            except Exception as e:
+                print(f"Error creating map: {e}")
+                import traceback
+                traceback.print_exc()
+                return assignments, routes, None
+            
+            # Display results
+            try:
+                self._display_results(assignments, routes, map_file, vehicles)
+            except Exception as e:
+                print(f"Error displaying results: {e}")
+            
+            return assignments, routes, map_file
+            
+        except Exception as e:
+            print(f"Unexpected error in run_optimization: {e}")
+            import traceback
+            traceback.print_exc()
             return {}, {}, None
-        
-        # Assign requests to vehicles
-        assignments = self.assign_requests_to_vehicles(requests, vehicles)
-        
-        # Optimize routes for each vehicle
-        routes = {}
-        for vehicle_id, vehicle_requests in assignments.items():
-            if vehicle_requests:
-                routes[vehicle_id] = self.optimize_route_with_location_service(vehicle_id, vehicle_requests)
-        
-        # Create map
-        map_file = self.create_route_map(assignments, routes)
-        
-        # Display results
-        self._display_results(assignments, routes, map_file, vehicles)
-        
-        return assignments, routes, map_file
     
     def _display_results(self, assignments: Dict, routes: Dict, map_file: str, vehicles: List[Dict]):
         """Display optimization results"""
