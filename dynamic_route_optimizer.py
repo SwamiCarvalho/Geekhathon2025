@@ -258,8 +258,9 @@ class DynamicRouteOptimizer:
             
             cumulative_time = 0
             for i, stop in enumerate(sequence):
-                if i < len(legs):
-                    cumulative_time += legs[i].get('DurationSeconds', 0)
+                # Add travel time to reach this stop
+                if i > 0 and i-1 < len(legs):
+                    cumulative_time += legs[i-1].get('DurationSeconds', 0)
                 
                 if stop['type'] == 'pickup':
                     passenger_pickup_times[stop['requestId']] = cumulative_time
@@ -268,7 +269,7 @@ class DynamicRouteOptimizer:
                     pickup_time = passenger_pickup_times.get(stop['requestId'], 0)
                     journey_time = cumulative_time - pickup_time
                     stop['cumulative_duration'] = cumulative_time
-                    stop['passenger_journey_time'] = journey_time
+                    stop['passenger_journey_time'] = max(journey_time, 0)  # Ensure non-negative
             
             # Calculate fuel efficiency metrics
             total_distance_km = response['Summary']['Distance'] / 1000
