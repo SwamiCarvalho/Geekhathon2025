@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { Send, Phone } from 'lucide-react';
 
-const LEX_LAMBDA_URL = 'https://rsnxivhcmh4ubkrf52htu7u5di0uxwjh.lambda-url.us-east-1.on.aws/'; 
-//const LEX_LAMBDA_URL = 'https://ioxuvzzxueotd2zrl6ydscoaem0hpkhs.lambda-url.us-east-1.on.aws/'; 
+const BEDROCK_LAMBDA_URL = 'https://rsnxivhcmh4ubkrf52htu7u5di0uxwjh.lambda-url.us-east-1.on.aws/'; 
 
 const BusBookingApp = () => {
   const [messages, setMessages] = useState([
@@ -16,41 +15,41 @@ const BusBookingApp = () => {
     setMessages(prev => [...prev, { type, text, timestamp: new Date() }]);
   };
 
+
+
   const handleTextSubmit = async () => {
     if (!inputText.trim()) return;
 
-    addMessage('user', inputText);
+    const messageToSend = inputText;
+    addMessage('user', messageToSend);
+    setInputText('');
     setIsProcessing(true);
 
     try {
 
-      const resp = await fetch(LEX_LAMBDA_URL, {
+      const resp = await fetch(BEDROCK_LAMBDA_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: inputText, sessionId })
+        body: JSON.stringify({ message: messageToSend, sessionId })
       });
 
       if (!resp.ok) throw new Error(`HTTP error! status: ${resp.status}`);
-      const { lexResponse } = await resp.json();
-
-
-      // Extract message from Bedrock response
-      let lexMessage;
+      const response = await resp.json();
       
-      if (lexResponse?.parsedData) {
-        const { origin, destination, time, date, closest_station } = lexResponse.parsedData;
-        lexMessage = `Confirmed receiving request for bus rides from: ${origin}, to ${destination}, at ${time} on ${date}! The closest bus stop is ${closest_station}.`;
-      } else {
-        lexMessage = 'Could not parse your request. Please use format: "I want to go from [origin] to [destination] at [time] on [date]"';
-      }
+      console.log('Lambda response:', response);
       
-      addMessage('bot', lexMessage);
+      // Extract the actual response from lexResponse wrapper
+      const lexResponse = response.lexResponse;
+
+      // Handle response - all responses are now text-only
+      const botMessage = lexResponse?.message || 'Could not process your request. Please try again.';
+      
+      addMessage('bot', botMessage);
 
     } catch (err) {
-      console.error('Lex text error:', err.stack);
-      addMessage('bot', '❌ Error talking to Lex.');
+      console.error('Bedrock Lambda error:', err.stack);
+      addMessage('bot', '❌ Error processing your request.');
     } finally {
-      setInputText('');
       setIsProcessing(false);
     }
   };
@@ -73,7 +72,11 @@ const BusBookingApp = () => {
                 <div className={`max-w-xs p-3 rounded-2xl ${msg.type === 'user'
                   ? 'bg-indigo-600 text-white'
                   : 'bg-gray-700 text-gray-100 border border-gray-600'}`}>
-                  <p className="text-sm whitespace-pre-line">{msg.text}</p>
+                  {msg.text.includes('<') ? (
+                    <div className="text-sm" dangerouslySetInnerHTML={{ __html: msg.text }} />
+                  ) : (
+                    <p className="text-sm whitespace-pre-line">{msg.text}</p>
+                  )}
                   {msg.timestamp && (
                     <div className="text-xs mt-1 text-gray-400">
                       {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}

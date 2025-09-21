@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dynamic Route Optimizer</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <style>
+        .custom-div-icon {
+            background: transparent;
+            border: none;
+        }
+        .vehicle-icon {
+            background: transparent;
+            border: none;
+            font-size: 20px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Time Filter Panel -->
+    <div style="position: fixed; top: 10px; left: 10px; width: 300px; background: white; border: 2px solid grey; z-index: 9999; padding: 10px;">
+        <h4>Time Filter</h4>
+        <label>Start Time:</label><br>
+        <input type="datetime-local" id="startTime" style="width:100%; margin:5px 0;"><br>
+        <label>End Time:</label><br>
+        <input type="datetime-local" id="endTime" style="width:100%; margin:5px 0;"><br>
+        <button onclick="filterRoutes()" style="width:100%; padding:5px; background:#007cba; color:white; border:none; cursor:pointer;">Filter Routes</button>
+        <button onclick="clearFilter()" style="width:100%; padding:5px; margin-top:5px; background:#666; color:white; border:none; cursor:pointer;">Show All</button>
+        <div id="filterStatus" style="margin-top:10px; font-size:11px; color:#666;">Showing all routes</div>
+    </div>
+    
+    <!-- Route Legend Panel -->
+    <div style="position: fixed; bottom: 50px; left: 50px; width: 250px; background: white; border: 2px solid grey; z-index: 9999; padding: 10px;">
+        <h4>Route Legend</h4>
+        <div id="legendContent"></div>
+        <p><span style="background-color:#333;color:white;border-radius:50%;padding:2px 6px;font-size:12px;">1</span> HOP ON (Pickup)</p>
+        <p><span style="background-color:white;color:#333;border:2px solid #333;border-radius:50%;padding:2px 6px;font-size:12px;">2</span> DROP OFF</p>
+        <p>🚗 Vehicle Start Position</p>
+        <p><strong>Numbers show stop order</strong></p>
+    </div>
+    
+    <!-- Optimization Info Panel -->
+    <div style="position: fixed; top: 10px; right: 10px; width: 280px; background: white; border: 2px solid grey; z-index: 9999; padding: 10px;">
+        <h4>Route Optimization</h4>
+        <p><strong>Objectives:</strong></p>
+        <p>• Minimize travel time</p>
+        <p>• Minimize waiting time (&lt;30 min)</p>
+        <p>• Optimize vehicle utilization</p>
+    </div>
+    
+    <!-- Map Container -->
+    <div id="map" style="height: 100vh; width: 100%;"></div>
+    
+    <script>
+        let map = L.map('map').setView([39.7491, -8.8118], 12);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+        
+        let currentMarkers = [];
+        let currentPolylines = [];
+        
+        function loadRoutes(startTime = null, endTime = null) {
+            // Clear existing markers and polylines
+            currentMarkers.forEach(marker => map.removeLayer(marker));
+            currentPolylines.forEach(polyline => map.removeLayer(polyline));
+            currentMarkers = [];
+            currentPolylines = [];
+            
+            const params = new URLSearchParams();
+            if (startTime) params.append('start', startTime);
+            if (endTime) params.append('end', endTime);
+            
+            fetch('/api/routes?' + params.toString())
+                .then(response => response.json())
+                .then(data => {
+                    const colors = ['red', 'blue', 'green', 'purple', 'orange'];
+                    
+                    // Update legend
+                    const legendContent = document.getElementById('legendContent');
+                    legendContent.innerHTML = '';
+                    
+                    Object.entries(data.assignments).forEach(([vehicleId, requests], i) => {
+                        const color = colors[i % colors.length];
+                        const route = data.routes[vehicleId];
+                        
+                        // Add to legend if vehicle has requests
+                        if (requests.length > 0) {
+                            legendContent.innerHTML += `<p><span style="color:${color};">■</span> Vehicle ${vehicleId}</p>`;
+                        }
+                        
+                        if (requests.length === 0) return;
+                        
+                        // Add route line
+                        if (route && route.waypoints && route.waypoints.length > 1) {
+                            const coords = route.waypoints.map(wp => [wp[1], wp[0]]);
+                            const polyline = L.polyline(coords, {color: color, weight: 3, opacity: 0.8}).addTo(map);
+                            currentPolylines.push(polyline);
+                        }
+                        
+                        // Add vehicle marker at first waypoint
+                        if (route && route.waypoints && route.waypoints.length > 0) {
+                            const vehicleIcon = L.divIcon({
+                                html: '🚗',
+                                iconSize: [30, 30],
+                                className: 'vehicle-icon'
+                            });
+                            const vehicleMarker = L.marker([route.waypoints[0][1], route.waypoints[0][0]], {icon: vehicleIcon})
+                                .bindPopup(`Vehicle ${vehicleId}`)
+                                .addTo(map);
+                            currentMarkers.push(vehicleMarker);
+                        }
+                        
+                        // Add numbered stop markers
+                        let stopNumber = 1;
+                        requests.forEach(req => {
+                            const pickupTime = req.requestedPickupAt || 'N/A';
+                            
+                            // Pickup marker with numbered circle
+                            if (req.origin_coords) {
+                                const pickupIcon = L.divIcon({
+                                    html: `<div style="background-color:${color};color:white;border-radius:50%;width:30px;height:30px;text-align:center;line-height:30px;font-weight:bold;font-size:12px;">${stopNumber}</div>`,
+                                    iconSize: [30, 30],
+                                    className: 'custom-div-icon'
+                                });
+                                const marker = L.marker([req.origin_coords[1], req.origin_coords[0]], {icon: pickupIcon})
+                                    .bindPopup(`Stop ${stopNumber}: HOP ON<br>Request: ${req.requestId}<br>Pickup Time: ${pickupTime}<br>Stop: ${req.originStopId}`)
+                                    .addTo(map);
+                                currentMarkers.push(marker);
+                                stopNumber++;
+                            }
+                            
+                            // Dropoff marker with numbered circle
+                            if (req.dest_coords) {
+                                const dropoffIcon = L.divIcon({
+                                    html: `<div style="background-color:white;color:${color};border:3px solid ${color};border-radius:50%;width:30px;height:30px;text-align:center;line-height:24px;font-weight:bold;font-size:12px;">${stopNumber}</div>`,
+                                    iconSize: [30, 30],
+                                    className: 'custom-div-icon'
+                                });
+                                const marker = L.marker([req.dest_coords[1], req.dest_coords[0]], {icon: dropoffIcon})
+                                    .bindPopup(`Stop ${stopNumber}: DROP OFF<br>Request: ${req.requestId}<br>Stop: ${req.destStopId}`)
+                                    .addTo(map);
+                                currentMarkers.push(marker);
+                                stopNumber++;
+                            }
+                        });
+                    });
+                })
+                .catch(error => {
+                    console.error('Error loading routes:', error);
+                    document.getElementById('filterStatus').innerHTML = 'Error loading routes';
+                });
+        }
+        
+        function filterRoutes() {
+            const start = document.getElementById('startTime').value;
+            const end = document.getElementById('endTime').value;
+            if (start && end) {
+                const startFormatted = start.replace('T', ' ');
+                const endFormatted = end.replace('T', ' ');
+                document.getElementById('filterStatus').innerHTML = `Filtered: ${startFormatted} to ${endFormatted}`;
+                loadRoutes(startFormatted, endFormatted);
+            } else {
+                alert('Please select both start and end times');
+            }
+        }
+        
+        function clearFilter() {
+            document.getElementById('startTime').value = '';
+            document.getElementById('endTime').value = '';
+            document.getElementById('filterStatus').innerHTML = 'Showing all routes';
+            loadRoutes();
+        }
+        
+        // Load initial routes when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            loadRoutes();
+        });
+    </script>
+</body>
+</html>

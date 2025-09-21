@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bus Pickup Request Simulator</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1a; color: #fff; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .chat-container { background: #2d2d2d; border-radius: 15px; padding: 20px; margin-bottom: 20px; height: 400px; overflow-y: auto; }
+        .message { margin-bottom: 15px; padding: 10px 15px; border-radius: 10px; max-width: 70%; }
+        .user-message { background: #007AFF; margin-left: auto; text-align: right; }
+        .bot-message { background: #3a3a3a; margin-right: auto; }
+        .input-container { display: flex; gap: 10px; margin-bottom: 20px; }
+        .message-input { flex: 1; padding: 15px; border: none; border-radius: 10px; background: #3a3a3a; color: #fff; font-size: 16px; }
+        .send-btn, .optimize-btn { padding: 15px 25px; border: none; border-radius: 10px; cursor: pointer; font-size: 16px; }
+        .send-btn { background: #007AFF; color: white; }
+        .optimize-btn { background: #34C759; color: white; width: 100%; }
+        .send-btn:hover { background: #0056CC; }
+        .optimize-btn:hover { background: #28A745; }
+        .stops-info { background: #2d2d2d; border-radius: 10px; padding: 15px; margin-bottom: 20px; }
+        .stops-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+        .stop-item { background: #3a3a3a; padding: 10px; border-radius: 8px; }
+        .timestamp { font-size: 12px; opacity: 0.7; margin-top: 5px; }
+        .loading { opacity: 0.6; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚌 Bus Pickup Request Simulator</h1>
+            <p>Simulate user requests and optimize routes in real-time</p>
+        </div>
+        
+        <div class="stops-info">
+            <h3>📍 Available Locations:</h3>
+            <div class="stops-grid">
+                <div class="stop-item"><strong>Downtown</strong><br>Main station</div>
+                <div class="stop-item"><strong>University</strong><br>Campus area</div>
+                <div class="stop-item"><strong>Mall</strong><br>Shopping center</div>
+                <div class="stop-item"><strong>Airport</strong><br>Terminal</div>
+                <div class="stop-item"><strong>Business</strong><br>Office district</div>
+            </div>
+        </div>
+        
+        <div class="chat-container" id="chatContainer">
+            <div class="message bot-message">
+                Hi! I can help you book a bus ride. Try saying something like:<br>
+                "I want to go from downtown to airport at 14:30"
+                <div class="timestamp" id="initialTime"></div>
+            </div>
+        </div>
+        
+        <div class="input-container">
+            <input type="text" id="messageInput" class="message-input" placeholder="Type your bus request..." onkeypress="handleKeyPress(event)">
+            <button onclick="sendMessage()" class="send-btn" id="sendBtn">Send</button>
+        </div>
+        
+        <button onclick="optimizeRoutes()" class="optimize-btn" id="optimizeBtn">🚌 Run Route Optimization</button>
+    </div>
+
+    <script>
+        document.getElementById('initialTime').textContent = new Date().toLocaleTimeString();
+        
+        function addMessage(text, isUser = false) {
+            const container = document.getElementById('chatContainer');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user-message' : 'bot-message'}`;
+            
+            const timestamp = document.createElement('div');
+            timestamp.className = 'timestamp';
+            timestamp.textContent = new Date().toLocaleTimeString();
+            
+            messageDiv.innerHTML = text.replace(/\n/g, '<br>');
+            messageDiv.appendChild(timestamp);
+            
+            container.appendChild(messageDiv);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const sendBtn = document.getElementById('sendBtn');
+            const message = input.value.trim();
+            
+            if (!message) return;
+            
+            addMessage(message, true);
+            input.value = '';
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Sending...';
+            sendBtn.classList.add('loading');
+            
+            try {
+                const response = await fetch('/api/send_message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    addMessage(data.response);
+                } else {
+                    addMessage(`❌ Error: ${data.error}`);
+                }
+            } catch (error) {
+                addMessage(`❌ Network error: ${error.message}`);
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Send';
+                sendBtn.classList.remove('loading');
+            }
+        }
+        
+        async function optimizeRoutes() {
+            const btn = document.getElementById('optimizeBtn');
+            btn.disabled = true;
+            btn.textContent = '🔄 Optimizing Routes...';
+            btn.classList.add('loading');
+            
+            addMessage('🚌 Starting route optimization...', false);
+            
+            try {
+                const response = await fetch('/api/optimize_routes', { method: 'POST' });
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    addMessage(`✅ ${data.message}`);
+                    if (data.map_file) {
+                        addMessage(`📍 <a href="/view_map/${data.map_file}" target="_blank" style="color: #007AFF;">Click here to view the optimized routes</a>`);
+                    }
+                } else {
+                    addMessage(`❌ ${data.message || data.error}`);
+                }
+            } catch (error) {
+                addMessage(`❌ Optimization error: ${error.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🚌 Run Route Optimization';
+                btn.classList.remove('loading');
+            }
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+        
+        // Focus on input when page loads
+        document.getElementById('messageInput').focus();
+    </script>
+</body>
+</html>

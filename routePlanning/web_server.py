@@ -56,10 +56,10 @@ def filter_routes():
 
 def open_browser():
     time.sleep(1)
-    webbrowser.open('http://localhost:5000')
+    webbrowser.open('http://localhost:5001')
 
 if __name__ == '__main__':
     import os
     if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
         threading.Thread(target=open_browser).start()
-    app.run(debug=True, use_reloader=True, port=5000, host='127.0.0.1')
+    app.run(debug=True, use_reloader=True, port=5001, host='127.0.0.1')
