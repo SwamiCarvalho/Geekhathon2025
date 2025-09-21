@@ -40,11 +40,17 @@ class DynamicRouteOptimizer:
             for req in requests:
                 pickup_dt = req.get('requestedPickupAt')
                 if pickup_dt:
-                    if start_time and pickup_dt < start_time:
-                        continue
-                    if end_time and pickup_dt > end_time:
-                        continue
-                filtered.append(req)
+                    # Only filter if both start and end times are provided
+                    if start_time and end_time:
+                        if pickup_dt >= start_time and pickup_dt <= end_time:
+                            filtered.append(req)
+                    elif start_time and pickup_dt >= start_time:
+                        filtered.append(req)
+                    elif end_time and pickup_dt <= end_time:
+                        filtered.append(req)
+                    elif not start_time and not end_time:
+                        filtered.append(req)
+            print(f"Filtered {len(filtered)} requests from {len(requests)} total requests")
             return filtered
         
         return requests
