@@ -1,5 +1,5 @@
 import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
-import { DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, ScanCommand, PutItemCommand } from "@aws-sdk/client-dynamodb";
 
 const bedrockClient = new BedrockRuntimeClient({ region: process.env.AWS_REGION || 'us-east-1' });
 
@@ -30,44 +30,18 @@ export const handler = async (event) => {
     const currentDate = now.toISOString().split('T')[0]; // YYYY-MM-DD
     const currentTime = now.toTimeString().split(' ')[0].slice(0, 5); // HH:MM
 
-    // Check if user is referencing numbered options (e.g., "Origin 1 Destination 2 at 15:30")
-    const numberPattern = /origin\s+(\d+).*?destination\s+(\d+).*?at\s+([\d:]+)/i;
-    const numberMatch = message.match(numberPattern);
-    
-    if (numberMatch) {
-      // User selected numbered options - create request directly
-      const [, originNum, destNum, time] = numberMatch;
-      
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ 
-          transcript: message, 
-          lexResponse: { 
-            parsedData: {
-              origin: `Selected Option ${originNum}`,
-              destination: `Selected Option ${destNum}`,
-              time: time,
-              date: currentDate,
-              originStopId: `option_${originNum}`,
-              destStopId: `option_${destNum}`
-            },
-            responseType: 'accepted',
-            message: `✅ Bus request created!\nFrom: Option ${originNum}\nTo: Option ${destNum}\nPickup: ${time}`
-          }
-        }),
-      };
-    }
+
 
     // Bedrock prompt for bus booking extraction in Leiria context
     const prompt = `Extract bus booking information from this user message in Leiria, Portugal context and return ONLY a valid JSON object.
 
 User message: "${message}"
 
-IMPORTANT: Every message MUST have an origin (from/departure) and destination (to/arrival). Extract these fields:
-- origin: departure location (REQUIRED - extract from message, look for "from", "de", starting point)
-- destination: arrival location (REQUIRED - extract from message, look for "to", "para", "até", ending point)  
-- time: departure time (if not specified, use "${currentTime}")
-- date: travel date (if not specified, use "${currentDate}")
+Extract these fields (use null if truly not mentioned):
+- origin: departure location (look for "from", "de", starting point, or null if not specified)
+- destination: arrival location (look for "to", "para", "até", ending point, or null if not specified)  
+- time: departure time (extract if mentioned, or null if not specified)
+- date: travel date (extract if mentioned, or "${currentDate}" as default)
 
 Context: This is for bus transportation in Leiria, Portugal. Common locations include:
 - Centro (city center)
@@ -78,8 +52,6 @@ Context: This is for bus transportation in Leiria, Portugal. Common locations in
 - Mercado (market)
 - Street names (Rua, Avenida)
 - Shops, restaurants, landmarks
-
-Always find both origin AND destination in the message. If unclear, make reasonable assumptions based on context.
 
 Return only the JSON object, no other text:`;
 
@@ -121,23 +93,108 @@ Return only the JSON object, no other text:`;
       };
     }
 
-    // Ensure origin and destination are never empty
-    if (!parsedData.origin || parsedData.origin === "not specified") {
-      parsedData.origin = "Centro";
+
+    
+    // Check for missing information
+    const missingOrigin = !parsedData.origin || parsedData.origin === "not specified" || parsedData.origin === null;
+    const missingDestination = !parsedData.destination || parsedData.destination === "not specified" || parsedData.destination === null;
+    const missingTime = !parsedData.time || parsedData.time === "not specified" || parsedData.time === null;
+    
+    // If critical information is missing, ask for it
+    if (missingOrigin && missingDestination) {
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ 
+          transcript: message, 
+          lexResponse: { 
+            parsedData: {},
+            responseType: 'conversation',
+            message: 'I need to know where you want to travel.\n\nPlease tell me:\n- Where are you starting from (origin)?\n- Where do you want to go (destination)?\n- What time do you need pickup?\n\nExample: "From Centro to Hospital at 15:30"'
+          }
+        }),
+      };
     }
-    if (!parsedData.destination || parsedData.destination === "not specified") {
-      parsedData.destination = "Estação";
+    
+    if (missingOrigin) {
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ 
+          transcript: message, 
+          lexResponse: { 
+            parsedData: { destination: parsedData.destination },
+            responseType: 'conversation',
+            message: `I see you want to go to ${parsedData.destination}. Where are you starting from?\n\nExample: "From Centro" or "From Piscinas Municipais"`
+          }
+        }),
+      };
     }
-    if (!parsedData.time || parsedData.time === "not specified") {
+    
+    if (missingDestination) {
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ 
+          transcript: message, 
+          lexResponse: { 
+            parsedData: { origin: parsedData.origin },
+            responseType: 'conversation',
+            message: `I see you're starting from ${parsedData.origin}. Where do you want to go?\n\nExample: "To Hospital" or "To Estação"`
+          }
+        }),
+      };
+    }
+    
+    // Set defaults for non-null values
+    if (!parsedData.time || parsedData.time === "not specified" || parsedData.time === null) {
       parsedData.time = currentTime;
     }
-    if (!parsedData.date || parsedData.date === "not specified") {
+    if (!parsedData.date || parsedData.date === "not specified" || parsedData.date === null) {
       parsedData.date = currentDate;
     }
 
     console.log("Final parsed data:", parsedData);
 
     const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+
+    // Function to save bus request to DynamoDB
+    async function saveBusRequest(originStopId, destStopId, requestedPickupAt) {
+      const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const putCommand = new PutItemCommand({
+        TableName: "requests",
+        Item: {
+          requestId: { S: requestId },
+          originStopId: { S: originStopId },
+          destStopId: { S: destStopId },
+          requestedPickupAt: { S: requestedPickupAt },
+          assignedVehicleId: { NULL: true },
+          isPMR: { S: "False" },
+          isSenior: { S: "False" },
+          status: { S: "False" }
+        }
+      });
+      
+      await dynamoClient.send(putCommand);
+      console.log(`Bus request saved with ID: ${requestId}`);
+      
+      // Trigger route recalculation
+      try {
+        const { spawn } = require('child_process');
+        const python = spawn('python', ['../routePlanning/dynamic_route_optimizer.py', 'recalculate']);
+        
+        python.stdout.on('data', (data) => {
+          console.log('Route optimizer output:', data.toString());
+        });
+        
+        python.stderr.on('data', (data) => {
+          console.error('Route optimizer error:', data.toString());
+        });
+        
+        console.log('Route recalculation triggered');
+      } catch (err) {
+        console.error('Failed to trigger route recalculation:', err.message);
+      }
+      return requestId;
+    }
 
     // Get all bus stops from DynamoDB
     console.log("Fetching bus stops from DynamoDB...");
@@ -397,6 +454,11 @@ Generate only the response text:`;
         responseType = 'accepted';
         parsedData.originStopId = originStops[0].stop_id;
         parsedData.destStopId = destStops[0].stop_id;
+        
+        // Save to DynamoDB
+        const requestedPickupAt = `${parsedData.date} ${parsedData.time}:00`;
+        await saveBusRequest(originStops[0].stop_id, destStops[0].stop_id, requestedPickupAt);
+        
         responseMessage = `✅ Bus request created!\nFrom: ${originStops[0].name}\nTo: ${destStops[0].name}\nPickup: ${parsedData.time}`;
       } else {
         // Ask for pickup time
@@ -407,14 +469,34 @@ Generate only the response text:`;
       }
     } else {
       // Check if user provided exact matches that should create request
-      const exactOriginMatch = originStops.find(stop => 
-        stop.name.toLowerCase().includes(parsedData.origin.toLowerCase()) ||
-        parsedData.origin.toLowerCase().includes(stop.name.toLowerCase())
-      );
-      const exactDestMatch = destStops.find(stop => 
-        stop.name.toLowerCase().includes(parsedData.destination.toLowerCase()) ||
-        parsedData.destination.toLowerCase().includes(stop.name.toLowerCase())
-      );
+      const exactOriginMatch = originStops.find(stop => {
+        const stopName = stop.name.toLowerCase();
+        const userOrigin = parsedData.origin.toLowerCase();
+        
+        // Direct match or partial match (either direction)
+        return stopName.includes(userOrigin) || 
+               userOrigin.includes(stopName) ||
+               // Handle common variations
+               (stopName.includes('piscinas') && userOrigin.includes('piscinas')) ||
+               (stopName.includes('estádio') && (userOrigin.includes('stadium') || userOrigin.includes('estadio'))) ||
+               (stopName.includes('hospital') && userOrigin.includes('hospital')) ||
+               (stopName.includes('centro') && userOrigin.includes('centro'));
+      });
+      
+      const exactDestMatch = destStops.find(stop => {
+        const stopName = stop.name.toLowerCase();
+        const userDest = parsedData.destination.toLowerCase();
+        
+        // Direct match or partial match (either direction)
+        return stopName.includes(userDest) || 
+               userDest.includes(stopName) ||
+               // Handle common variations and specific matches
+               (stopName.includes('hospital') && userDest.includes('hospital')) ||
+               (stopName.includes('visitas') && userDest.includes('visitas')) ||
+               (stopName.includes('consultas') && userDest.includes('consultas')) ||
+               (stopName.includes('centro') && userDest.includes('centro')) ||
+               (stopName.includes('estação') && (userDest.includes('station') || userDest.includes('estacao')));
+      });
       
       const hasTime = parsedData.time && parsedData.time !== currentTime;
       
@@ -423,30 +505,32 @@ Generate only the response text:`;
         responseType = 'accepted';
         parsedData.originStopId = exactOriginMatch.stop_id;
         parsedData.destStopId = exactDestMatch.stop_id;
+        
+        // Save to DynamoDB
+        const requestedPickupAt = `${parsedData.date} ${parsedData.time}:00`;
+        await saveBusRequest(exactOriginMatch.stop_id, exactDestMatch.stop_id, requestedPickupAt);
+        
         responseMessage = `✅ Bus request created!\nFrom: ${exactOriginMatch.name}\nTo: ${exactDestMatch.name}\nPickup: ${parsedData.time}`;
       } else {
-        // Multiple matches - ask for clarification with numbered options
+        // Multiple matches - ask for clarification
         let clarificationText = '';
         
         if (originStops.length > 1) {
           const originNames = [...new Set(originStops.map(s => s.name))];
-          const numberedOrigins = originNames.map((name, i) => `${i + 1}. ${name}`).join('\n');
-          clarificationText += `Origin options:\n${numberedOrigins}\n\n`;
+          clarificationText += `Origin options:\n${originNames.map((name, i) => `${i + 1}. ${name}`).join('\n')}\n\n`;
         }
         
         if (destStops.length > 1) {
           const destNames = [...new Set(destStops.map(s => s.name))];
-          const numberedDests = destNames.map((name, i) => `${i + 1}. ${name}`).join('\n');
-          clarificationText += `Destination options:\n${numberedDests}\n\n`;
+          clarificationText += `Destination options:\n${destNames.map((name, i) => `${i + 1}. ${name}`).join('\n')}\n\n`;
         }
         
         if (!hasTime) {
           clarificationText += 'Please specify pickup time\n\n';
         }
         
-        clarificationText += 'Example: "Origin 1, Destination 2 at 15:30" or "From Centro to Hospital at 15:30"';
+        clarificationText += 'Please be more specific with the exact stop names.';
         
-        // Direct response for clarification to avoid AI formatting issues
         responseMessage = `Welcome to QuickBus! Our flexible service adapts routes to your needs with no fixed schedules.\n\n${clarificationText}`;
       }
     }
