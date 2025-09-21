@@ -54,7 +54,7 @@ class DynamicRouteOptimizer:
         response = self.vehicles_table.scan(Limit=3)
         return response['Items']
     
-    def assign_requests_to_vehicles(self, requests: List[Dict], vehicles: List[Dict], max_wait_minutes: int = 15, max_travel_minutes: int = 45) -> Dict[str, List[Dict]]:
+    def assign_requests_to_vehicles(self, requests: List[Dict], vehicles: List[Dict], max_wait_minutes: int = 15, max_travel_minutes: int = 20) -> Dict[str, List[Dict]]:
         """Assign ALL requests to vehicles considering time and travel duration constraints"""
         assignments = {vehicle['vehicleId']: [] for vehicle in vehicles}
         
@@ -135,64 +135,93 @@ class DynamicRouteOptimizer:
         return estimated_duration > max_travel_minutes
     
     def _calculate_assignment_cost(self, request: Dict, vehicle: Dict, current_requests: List[Dict]) -> float:
-        """Calculate cost of assigning request to vehicle"""
+        """Enhanced cost calculation for fuel efficiency and environmental impact"""
         origin_coords = self.get_stop_coords(request['originStopId'])
-        if not origin_coords:
+        dest_coords = self.get_stop_coords(request['destStopId'])
+        if not origin_coords or not dest_coords:
             return float('inf')
         
         vehicle_pos = [float(vehicle.get('longitude', 0)), float(vehicle.get('latitude', 0))]
-        distance_cost = self._calculate_distance(vehicle_pos, origin_coords)
         
-        # Time-based penalty
-        time_penalty = 0
-        request_dt = request.get('requestedPickupAt')
-        if request_dt:
-            for existing in current_requests:
-                existing_dt = existing.get('requestedPickupAt')
-                if existing_dt:
-                    time_diff = abs((request_dt - existing_dt).total_seconds())
-                    time_penalty += time_diff * 0.001
+        # 1. Distance cost (fuel consumption)
+        distance_to_pickup = self._calculate_distance(vehicle_pos, origin_coords)
+        trip_distance = self._calculate_distance(origin_coords, dest_coords)
         
-        return distance_cost + time_penalty
+        # 2. Route efficiency - estimate total route distance with new request
+        route_efficiency_penalty = self._calculate_route_efficiency_penalty(request, current_requests)
+        
+        # 3. Vehicle utilization bonus (more passengers = better efficiency)
+        utilization_bonus = -len(current_requests) * 0.1  # Negative = bonus
+        
+        # 4. Time clustering bonus (requests close in time = efficient)
+        time_clustering_bonus = self._calculate_time_clustering_bonus(request, current_requests)
+        
+        # 5. Geographic clustering bonus (nearby stops = less fuel)
+        geo_clustering_bonus = self._calculate_geo_clustering_bonus(request, current_requests)
+        
+        total_cost = (
+            distance_to_pickup * 2.0 +  # Weight distance to pickup heavily
+            trip_distance * 0.5 +       # Trip distance matters less
+            route_efficiency_penalty +
+            utilization_bonus +
+            time_clustering_bonus +
+            geo_clustering_bonus
+        )
+        
+        return total_cost
     
 
     
     def optimize_route_with_location_service(self, vehicle_id: str, requests: List[Dict]) -> Dict:
-        """Enhanced route optimization with optimal pickup/dropoff sequence"""
+        """Enhanced route optimization prioritizing dropoffs to minimize passenger travel time"""
         if not requests:
             return {'route': [], 'distance': 0, 'duration': 0}
         
         # Sort requests by pickup time
         sorted_requests = sorted(requests, key=lambda r: r.get('requestedPickupAt') or datetime.fromtimestamp(0))
         
-        # Create all stops (pickups and dropoffs) with optimal sequencing
+        # Create optimized stop sequence prioritizing dropoffs
         all_stops = []
-        for req in sorted_requests:
+        pickup_order = {}
+        
+        # First pass: add pickups in time order
+        for i, req in enumerate(sorted_requests):
             origin = self.get_stop_coords(req['originStopId'])
-            dest = self.get_stop_coords(req['destStopId'])
             pickup_dt = req.get('requestedPickupAt')
             pickup_time = pickup_dt.strftime('%H:%M') if pickup_dt else 'N/A'
             
             if origin:
-                all_stops.append({
+                pickup_stop = {
                     'type': 'pickup',
                     'requestId': req.get('requestId'),
                     'stopId': req['originStopId'],
                     'time': pickup_time,
                     'coords': origin,
+                    'pickup_order': i,
                     'priority': pickup_dt.timestamp() if pickup_dt else 0
-                })
-            
+                }
+                all_stops.append(pickup_stop)
+                pickup_order[req.get('requestId')] = i
+        
+        # Add all dropoffs with proper timing
+        for req in sorted_requests:
+            dest = self.get_stop_coords(req['destStopId'])
             if dest:
-                all_stops.append({
+                pickup_dt = req.get('requestedPickupAt')
+                # Dropoff should be after pickup with reasonable travel time
+                dropoff_priority = (pickup_dt.timestamp() + 600) if pickup_dt else 999999  # 10 min after pickup
+                
+                dropoff_stop = {
                     'type': 'dropoff',
                     'requestId': req.get('requestId'),
                     'stopId': req['destStopId'],
                     'coords': dest,
-                    'priority': (pickup_dt.timestamp() + 1800) if pickup_dt else 999999  # 30 min after pickup
-                })
+                    'priority': dropoff_priority,
+                    'pickup_order': pickup_order.get(req.get('requestId'), 999)
+                }
+                all_stops.append(dropoff_stop)
         
-        # Sort by priority for optimal sequence (pickup time + dropoff delay)
+        # Sort all stops by priority (pickup time, then dropoff time)
         all_stops.sort(key=lambda x: x['priority'])
         
         waypoints = [stop['coords'] for stop in all_stops]
@@ -223,13 +252,28 @@ class DynamicRouteOptimizer:
                 if 'Geometry' in response['Legs'][0]:
                     print(f"Geometry keys: {response['Legs'][0]['Geometry'].keys()}")
             
-            # Add cumulative duration to sequence stops
+            # Calculate passenger journey times correctly
             legs = response.get('Legs', [])
-            cumulative_duration = 0
+            passenger_pickup_times = {}  # Track when each passenger was picked up
+            
+            cumulative_time = 0
             for i, stop in enumerate(sequence):
                 if i < len(legs):
-                    cumulative_duration += legs[i].get('DurationSeconds', 0)
-                stop['cumulative_duration'] = cumulative_duration
+                    cumulative_time += legs[i].get('DurationSeconds', 0)
+                
+                if stop['type'] == 'pickup':
+                    passenger_pickup_times[stop['requestId']] = cumulative_time
+                    stop['cumulative_duration'] = cumulative_time
+                elif stop['type'] == 'dropoff':
+                    pickup_time = passenger_pickup_times.get(stop['requestId'], 0)
+                    journey_time = cumulative_time - pickup_time
+                    stop['cumulative_duration'] = cumulative_time
+                    stop['passenger_journey_time'] = journey_time
+            
+            # Calculate fuel efficiency metrics
+            total_distance_km = response['Summary']['Distance'] / 1000
+            fuel_consumption = total_distance_km * 0.08  # Assume 8L/100km
+            co2_emissions = fuel_consumption * 2.31  # kg CO2 per liter diesel
             
             return {
                 'route': response['Legs'],
@@ -237,13 +281,19 @@ class DynamicRouteOptimizer:
                 'duration': response['Summary']['DurationSeconds'],
                 'waypoints': waypoints,
                 'sequence': sequence,
-                'geometry': response.get('Legs', [])  # Contains actual road geometry
+                'geometry': response.get('Legs', []),
+                'fuel_consumption_liters': round(fuel_consumption, 2),
+                'co2_emissions_kg': round(co2_emissions, 2),
+                'passengers_served': len(requests)
             }
         except Exception as e:
             print(f"Route optimization failed: {e}")
-            return {'route': [], 'distance': 0, 'duration': 0, 'waypoints': waypoints, 'sequence': sequence}
+            return {
+                'route': [], 'distance': 0, 'duration': 0, 'waypoints': waypoints, 'sequence': sequence,
+                'fuel_consumption_liters': 0, 'co2_emissions_kg': 0, 'passengers_served': len(requests)
+            }
     
-    def create_route_map(self, assignments: Dict[str, List[Dict]], routes: Dict[str, Dict]) -> str:
+    def create_route_map(self, assignments: Dict[str, List[Dict]], routes: Dict[str, Dict], vehicles: List[Dict] = None) -> str:
         """Create interactive map with routes"""
         try:
             print("Starting map creation...")
@@ -255,6 +305,11 @@ class DynamicRouteOptimizer:
             
             colors = ['red', 'blue', 'green', 'purple', 'orange']
             print(f"Created base map centered at {center_lat}, {center_lon}")
+            
+            # Check if there are any assignments
+            has_routes = any(len(reqs) > 0 for reqs in assignments.values())
+            if not has_routes:
+                print("No routes to display - creating empty map")
         except Exception as e:
             print(f"Error creating base map: {e}")
             raise
@@ -349,21 +404,21 @@ class DynamicRouteOptimizer:
                     if dropoff_stops:
                         popup_content += "<b>DROPOFFS:</b><br>"
                         for stop in dropoff_stops:
-                            duration_mins = stop.get('cumulative_duration', 0) // 60
-                            popup_content += f"• Request {stop['requestId']} - Trip: {duration_mins}min<br>"
+                            journey_mins = stop.get('passenger_journey_time', 0) // 60
+                            popup_content += f"• Request {stop['requestId']} - Journey: {journey_mins}min<br>"
                     
                     popup_content += f"Stop ID: {stops[0]['stopId']}"
                     
-                    # Choose icon style based on stop type
+                    # Choose icon style based on stop type with vehicle data attribute
                     if pickup_stops and dropoff_stops:
                         # Mixed stop - both pickup and dropoff
-                        icon_html = f'<div style="background: linear-gradient(45deg, {color} 50%, white 50%);color:black;border:2px solid {color};border-radius:50%;width:30px;height:30px;text-align:center;line-height:26px;font-weight:bold;font-size:12px;">{stop_number}</div>'
+                        icon_html = f'<div data-vehicle="{vehicle_id}" style="background: linear-gradient(45deg, {color} 50%, white 50%);color:black;border:2px solid {color};border-radius:50%;width:30px;height:30px;text-align:center;line-height:26px;font-weight:bold;font-size:12px;">{stop_number}</div>'
                     elif pickup_stops:
                         # Pickup only
-                        icon_html = f'<div style="background-color:{color};color:white;border-radius:50%;width:30px;height:30px;text-align:center;line-height:30px;font-weight:bold;font-size:12px;">{stop_number}</div>'
+                        icon_html = f'<div data-vehicle="{vehicle_id}" style="background-color:{color};color:white;border-radius:50%;width:30px;height:30px;text-align:center;line-height:30px;font-weight:bold;font-size:12px;">{stop_number}</div>'
                     else:
                         # Dropoff only
-                        icon_html = f'<div style="background-color:white;color:{color};border:3px solid {color};border-radius:50%;width:30px;height:30px;text-align:center;line-height:24px;font-weight:bold;font-size:12px;">{stop_number}</div>'
+                        icon_html = f'<div data-vehicle="{vehicle_id}" style="background-color:white;color:{color};border:3px solid {color};border-radius:50%;width:30px;height:30px;text-align:center;line-height:24px;font-weight:bold;font-size:12px;">{stop_number}</div>'
                     
                     folium.Marker(
                         [coords[1], coords[0]],
@@ -374,8 +429,19 @@ class DynamicRouteOptimizer:
                         )
                     ).add_to(m)
         
-        # Add interactive time filter controls
+        # Generate optimization info (only if vehicles provided)
+        optimization_info = self.generate_optimization_info(assignments, routes, vehicles) if vehicles else "<p>No vehicle information available</p>"
+        
+        # Add interactive time filter controls with CSS for vehicle toggling
         filter_html = f'''
+        <style>
+        .vehicle-toggle {{
+            margin: 2px 0;
+        }}
+        .vehicle-toggle input {{
+            margin-right: 5px;
+        }}
+        </style>
         <div style="position: fixed; 
                     top: 10px; left: 10px; width: 300px; height: auto; 
                     background-color: white; border:2px solid grey; z-index:9999; 
@@ -388,13 +454,57 @@ class DynamicRouteOptimizer:
         <label>Max Waiting Time (minutes):</label><br>
         <input type="number" id="maxWaitTime" value="15" min="5" max="120" style="width:100%; margin:5px 0;"><br>
         <label>Max Travel Duration (minutes):</label><br>
-        <input type="number" id="maxTravelTime" value="45" min="15" max="180" style="width:100%; margin:5px 0;"><br>
+        <input type="number" id="maxTravelTime" value="20" min="15" max="180" style="width:100%; margin:5px 0;"><br>
         <button onclick="filterRoutes()" style="width:100%; padding:5px; background:#007cba; color:white; border:none; cursor:pointer;">Filter Routes</button>
         <button onclick="clearFilter()" style="width:100%; padding:5px; margin-top:5px; background:#666; color:white; border:none; cursor:pointer;">Show All</button>
+        <button onclick="showOptimizationInfo()" style="width:100%; padding:5px; margin-top:5px; background:#28a745; color:white; border:none; cursor:pointer;">📊 Route Details</button>
         <div id="filterStatus" style="margin-top:10px; font-size:11px; color:#666;">Showing all routes</div>
         </div>
         
+        <!-- Optimization Info Modal -->
+        <div id="optimizationModal" style="display:none; position:fixed; z-index:10000; left:0; top:0; width:100%; height:100%; background-color:rgba(0,0,0,0.5);">
+            <div style="background-color:white; margin:5% auto; padding:20px; border:1px solid #888; width:80%; max-height:80%; overflow-y:auto;">
+                <span onclick="closeOptimizationInfo()" style="color:#aaa; float:right; font-size:28px; font-weight:bold; cursor:pointer;">&times;</span>
+                <div id="optimizationContent">{optimization_info}</div>
+            </div>
+        </div>
+        
         <script>
+        // Load current URL parameters into form fields
+        window.onload = function() {{
+            const urlParams = new URLSearchParams(window.location.search);
+            const start = urlParams.get('start');
+            const end = urlParams.get('end');
+            const maxWait = urlParams.get('maxwait') || '15';
+            const maxTravel = urlParams.get('maxtravel') || '20';
+            
+            if (start) {{
+                document.getElementById('startTime').value = start.replace(' ', 'T');
+            }} else {{
+                // Set default to today 7am
+                const today = new Date();
+                today.setHours(7, 0, 0, 0);
+                document.getElementById('startTime').value = today.toISOString().slice(0, 16);
+            }}
+            if (end) {{
+                document.getElementById('endTime').value = end.replace(' ', 'T');
+            }} else {{
+                // Set default to today 7pm
+                const today = new Date();
+                today.setHours(19, 0, 0, 0);
+                document.getElementById('endTime').value = today.toISOString().slice(0, 16);
+            }}
+            document.getElementById('maxWaitTime').value = maxWait;
+            document.getElementById('maxTravelTime').value = maxTravel;
+            
+            // Update status message
+            if (start && end) {{
+                document.getElementById('filterStatus').innerHTML = `Filtered: ${{start}} to ${{end}}`;
+            }} else {{
+                document.getElementById('filterStatus').innerHTML = 'Showing all routes';
+            }}
+        }};
+        
         function filterRoutes() {{
             const start = document.getElementById('startTime').value;
             const end = document.getElementById('endTime').value;
@@ -414,14 +524,81 @@ class DynamicRouteOptimizer:
             document.getElementById('startTime').value = '';
             document.getElementById('endTime').value = '';
             document.getElementById('maxWaitTime').value = '15';
-            document.getElementById('maxTravelTime').value = '45';
+            document.getElementById('maxTravelTime').value = '20';
             document.getElementById('filterStatus').innerHTML = 'Showing all routes';
             window.location.href = '/';
+        }}
+        
+        function showOptimizationInfo() {{
+            document.getElementById('optimizationModal').style.display = 'block';
+        }}
+        
+        function closeOptimizationInfo() {{
+            document.getElementById('optimizationModal').style.display = 'none';
+        }}
+        
+        window.onclick = function(event) {{
+            const modal = document.getElementById('optimizationModal');
+            if (event.target == modal) {{
+                modal.style.display = 'none';
+            }}
+        }}
+        
+        function toggleVehicle(vehicleId, color) {{
+            const checkbox = document.getElementById('vehicle_' + vehicleId);
+            const display = checkbox.checked ? '' : 'none';
+            
+            // Toggle route lines (SVG paths with specific color)
+            const paths = document.querySelectorAll('path[stroke="' + color + '"]');
+            paths.forEach(function(path) {{
+                path.style.display = display;
+            }});
+            
+            // Toggle vehicle car markers (find by popup content)
+            const markers = document.querySelectorAll('.leaflet-marker-icon');
+            markers.forEach(function(marker) {{
+                // Check if this is a vehicle marker by looking for car icon or vehicle popup
+                if (marker.innerHTML && marker.innerHTML.includes('fa-car')) {{
+                    // This is likely a vehicle marker, check popup for vehicle ID
+                    const markerParent = marker.closest('.leaflet-marker-pane');
+                    if (markerParent) {{
+                        // Find associated popup or check marker attributes
+                        const hasVehicleId = marker.outerHTML.includes(vehicleId) || 
+                                           (marker.title && marker.title.includes(vehicleId));
+                        if (hasVehicleId) {{
+                            marker.style.display = display;
+                        }}
+                    }}
+                }}
+            }});
+            
+            // Toggle stop markers with data-vehicle attribute
+            const stopMarkers = document.querySelectorAll('[data-vehicle="' + vehicleId + '"]');
+            stopMarkers.forEach(function(marker) {{
+                // Hide the entire marker container
+                const markerContainer = marker.closest('.leaflet-marker-icon') || marker.closest('.leaflet-div-icon');
+                if (markerContainer) {{
+                    markerContainer.style.display = display;
+                }} else {{
+                    marker.style.display = display;
+                }}
+            }});
+            
+            // Also toggle by color for any remaining elements
+            setTimeout(function() {{
+                const divIcons = document.querySelectorAll('.leaflet-div-icon');
+                divIcons.forEach(function(icon) {{
+                    const innerDiv = icon.querySelector('[data-vehicle="' + vehicleId + '"]');
+                    if (innerDiv) {{
+                        icon.style.display = display;
+                    }}
+                }});
+            }}, 50);
         }}
         </script>
         '''
         
-        # Add legend
+        # Add legend with vehicle toggles
         legend_html = '''
         <div style="position: fixed; 
                     bottom: 50px; left: 50px; width: 250px; height: auto; 
@@ -429,18 +606,30 @@ class DynamicRouteOptimizer:
                     font-size:14px; padding: 10px">
         <h4>Route Legend</h4>
         '''        
+        
+        has_active_routes = False
         for i, (vehicle_id, _) in enumerate(assignments.items()):
             if assignments[vehicle_id]:
                 color = colors[i % len(colors)]
-                legend_html += f'<p><span style="color:{color};">■</span> Vehicle {vehicle_id}</p>'
+                legend_html += f'''
+                <p class="vehicle-toggle">
+                    <input type="checkbox" id="vehicle_{vehicle_id}" checked onchange="toggleVehicle('{vehicle_id}', '{color}')">
+                    <span style="color:{color};">■</span> Vehicle {vehicle_id}
+                </p>'''
+                has_active_routes = True
         
-        legend_html += '''
-        <p><span style="background-color:#333;color:white;border-radius:50%;padding:2px 6px;font-size:12px;">1</span> HOP ON (Pickup)</p>
-        <p><span style="background-color:white;color:#333;border:2px solid #333;border-radius:50%;padding:2px 6px;font-size:12px;">2</span> DROP OFF</p>
-        <p>🚗 Vehicle Start Position</p>
-        <p><strong>Numbers show stop order</strong></p>
-        </div>
-        '''
+        if has_active_routes:
+            legend_html += '''
+            <hr style="margin: 10px 0;">
+            <p><span style="background-color:#333;color:white;border-radius:50%;padding:2px 6px;font-size:12px;">1</span> HOP ON (Pickup)</p>
+            <p><span style="background-color:white;color:#333;border:2px solid #333;border-radius:50%;padding:2px 6px;font-size:12px;">2</span> DROP OFF</p>
+            <p>🚗 Vehicle Start Position</p>
+            <p><strong>Numbers show stop order</strong></p>
+            '''
+        else:
+            legend_html += '<p><em>No routes found for selected time period</em></p>'
+        
+        legend_html += '</div>'
         
         # Add optimization info panel
         info_html = '''
@@ -513,7 +702,99 @@ class DynamicRouteOptimizer:
         """Calculate distance between two points"""
         return ((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)**0.5
     
-    def run_optimization(self, start_datetime: str = None, end_datetime: str = None, max_wait_minutes: int = 15, max_travel_minutes: int = 45):
+    def _is_nearby(self, pos1: List[float], pos2: List[float], threshold: float = 0.01) -> bool:
+        """Check if two positions are nearby (within threshold distance)"""
+        return self._calculate_distance(pos1, pos2) < threshold
+    
+    def _calculate_route_efficiency_penalty(self, request: Dict, current_requests: List[Dict]) -> float:
+        """Calculate penalty for route inefficiency with fixed bus stops"""
+        if not current_requests:
+            return 0
+        
+        origin = self.get_stop_coords(request['originStopId'])
+        dest = self.get_stop_coords(request['destStopId'])
+        
+        # Get all existing stop coordinates
+        existing_coords = []
+        for req in current_requests:
+            o_coords = self.get_stop_coords(req['originStopId'])
+            d_coords = self.get_stop_coords(req['destStopId'])
+            if o_coords: existing_coords.append(o_coords)
+            if d_coords: existing_coords.append(d_coords)
+        
+        if not existing_coords:
+            return 0
+        
+        # Calculate route compactness - penalty for stops that create large detours
+        # Find the bounding box of existing stops
+        min_lon = min(coord[0] for coord in existing_coords)
+        max_lon = max(coord[0] for coord in existing_coords)
+        min_lat = min(coord[1] for coord in existing_coords)
+        max_lat = max(coord[1] for coord in existing_coords)
+        
+        # Penalty if new stops extend the route significantly
+        penalty = 0
+        if origin[0] < min_lon or origin[0] > max_lon or origin[1] < min_lat or origin[1] > max_lat:
+            penalty += 0.3  # Origin extends route
+        if dest[0] < min_lon or dest[0] > max_lon or dest[1] < min_lat or dest[1] > max_lat:
+            penalty += 0.3  # Destination extends route
+        
+        return penalty
+    
+    def _calculate_time_clustering_bonus(self, request: Dict, current_requests: List[Dict]) -> float:
+        """Bonus for requests with similar pickup times (efficient batching)"""
+        if not current_requests:
+            return 0
+        
+        request_dt = request.get('requestedPickupAt')
+        if not request_dt:
+            return 0
+        
+        # Calculate average time difference with existing requests
+        time_diffs = []
+        for existing in current_requests:
+            existing_dt = existing.get('requestedPickupAt')
+            if existing_dt:
+                time_diff = abs((request_dt - existing_dt).total_seconds()) / 60  # minutes
+                time_diffs.append(time_diff)
+        
+        if not time_diffs:
+            return 0
+        
+        avg_time_diff = sum(time_diffs) / len(time_diffs)
+        # Bonus for requests within 10 minutes of each other
+        return -max(0, (10 - avg_time_diff) * 0.02)  # Negative = bonus
+    
+    def _calculate_geo_clustering_bonus(self, request: Dict, current_requests: List[Dict]) -> float:
+        """Bonus for requests sharing same bus stops (efficient stop reuse)"""
+        if not current_requests:
+            return 0
+        
+        request_origin = request['originStopId']
+        request_dest = request['destStopId']
+        
+        shared_stops_bonus = 0
+        
+        # Check if any existing requests share the same origin or destination stops
+        for existing in current_requests:
+            existing_origin = existing['originStopId']
+            existing_dest = existing['destStopId']
+            
+            # Bonus for sharing pickup stop (multiple passengers board at same stop)
+            if request_origin == existing_origin:
+                shared_stops_bonus -= 0.2  # Strong bonus for shared pickup
+            
+            # Bonus for sharing dropoff stop (multiple passengers exit at same stop)
+            if request_dest == existing_dest:
+                shared_stops_bonus -= 0.2  # Strong bonus for shared dropoff
+            
+            # Bonus for origin-destination overlap (efficient routing)
+            if request_origin == existing_dest or request_dest == existing_origin:
+                shared_stops_bonus -= 0.1  # Medium bonus for route overlap
+        
+        return shared_stops_bonus
+    
+    def run_optimization(self, start_datetime: str = None, end_datetime: str = None, max_wait_minutes: int = 15, max_travel_minutes: int = 20):
         """Main optimization process with optional datetime filter, waiting time and travel duration"""
         try:
             print("Starting route optimization...")
@@ -556,8 +837,15 @@ class DynamicRouteOptimizer:
                 return {}, {}, None
             
             if not requests:
-                print("No requests found!")
-                return {}, {}, None
+                print("No requests found! Creating empty map.")
+                # Create empty map when no requests found
+                try:
+                    empty_assignments = {vehicle['vehicleId']: [] for vehicle in vehicles}
+                    map_file = self.create_route_map(empty_assignments, {}, vehicles)
+                    return empty_assignments, {}, map_file
+                except Exception as e:
+                    print(f"Error creating empty map: {e}")
+                    return {}, {}, None
                 
             if not vehicles:
                 print("No vehicles found!")
@@ -584,7 +872,7 @@ class DynamicRouteOptimizer:
             
             # Create map
             try:
-                map_file = self.create_route_map(assignments, routes)
+                map_file = self.create_route_map(assignments, routes, vehicles)
                 if map_file:
                     print(f"Successfully created map file: {map_file}")
                 else:
@@ -614,12 +902,20 @@ class DynamicRouteOptimizer:
         print("\n=== DYNAMIC ROUTE OPTIMIZATION RESULTS ===")
         
         total_requests = sum(len(reqs) for reqs in assignments.values())
-        total_distance = sum(route.get('distance', 0) for route in routes.values())
+        total_distance = sum(route.get('distance', 0) for route in routes.values()) / 1000  # Convert to km
         total_duration = sum(route.get('duration', 0) for route in routes.values())
+        total_fuel = sum(route.get('fuel_consumption_liters', 0) for route in routes.values())
+        total_co2 = sum(route.get('co2_emissions_kg', 0) for route in routes.values())
         
         print(f"Total Requests Assigned: {total_requests}")
         print(f"Total Route Distance: {total_distance:.2f} km")
         print(f"Total Route Duration: {total_duration//60:.0f} minutes")
+        print(f"\n=== ENVIRONMENTAL IMPACT ===")
+        print(f"Total Fuel Consumption: {total_fuel:.2f} liters")
+        print(f"Total CO2 Emissions: {total_co2:.2f} kg")
+        if total_requests > 0:
+            print(f"Fuel per Passenger: {total_fuel/total_requests:.2f} L")
+            print(f"CO2 per Passenger: {total_co2/total_requests:.2f} kg")
         if map_file:
             print(f"Map saved as: {map_file}")
         
@@ -665,11 +961,96 @@ class DynamicRouteOptimizer:
                 print(f"  Total stops: {(len(sorted_reqs) * 2)} stops for {len(sorted_reqs)} requests")
                 print(f"  Vehicle utilization: {len(sorted_reqs)}/{vehicle.get('capacity', 20)} capacity used")
                 
-                print(f"  Route distance: {route.get('distance', 0):.2f}km")
+                print(f"  Route distance: {route.get('distance', 0)/1000:.2f}km")
                 if route.get('duration'):
                     print(f"  Route duration: {route['duration']//60:.0f} minutes")
+                if route.get('fuel_consumption_liters'):
+                    print(f"  Fuel consumption: {route['fuel_consumption_liters']:.2f}L")
+                    print(f"  CO2 emissions: {route['co2_emissions_kg']:.2f}kg")
             else:
                 print(f"  No requests assigned")
+    
+    def generate_optimization_info(self, assignments: Dict, routes: Dict, vehicles: List[Dict]) -> str:
+        """Generate detailed optimization information for web display"""
+        total_requests = sum(len(reqs) for reqs in assignments.values())
+        total_distance = sum(route.get('distance', 0) for route in routes.values()) / 1000
+        total_duration = sum(route.get('duration', 0) for route in routes.values())
+        total_fuel = sum(route.get('fuel_consumption_liters', 0) for route in routes.values())
+        total_co2 = sum(route.get('co2_emissions_kg', 0) for route in routes.values())
+        
+        info_html = f"""
+        <h3>Route Optimization Results</h3>
+        <div style="margin-bottom: 20px;">
+            <h4>Summary</h4>
+            <p><strong>Total Requests:</strong> {total_requests}</p>
+            <p><strong>Total Distance:</strong> {total_distance:.2f} km</p>
+            <p><strong>Total Duration:</strong> {total_duration//60:.0f} minutes</p>
+        </div>
+        
+        <div style="margin-bottom: 20px;">
+            <h4>Environmental Impact</h4>
+            <p><strong>Fuel Consumption:</strong> {total_fuel:.2f} liters</p>
+            <p><strong>CO2 Emissions:</strong> {total_co2:.2f} kg</p>
+        """
+        
+        if total_requests > 0:
+            info_html += f"""
+            <p><strong>Fuel per Passenger:</strong> {total_fuel/total_requests:.2f} L</p>
+            <p><strong>CO2 per Passenger:</strong> {total_co2/total_requests:.2f} kg</p>
+            """
+        
+        info_html += "</div>"
+        
+        # Vehicle details
+        vehicles_map = {v['vehicleId']: v for v in vehicles}
+        
+        for vehicle_id in assignments.keys():
+            vehicle = vehicles_map.get(vehicle_id, {})
+            vehicle_requests = assignments[vehicle_id]
+            route = routes.get(vehicle_id, {})
+            
+            info_html += f"<div style='margin-bottom: 20px; border: 1px solid #ccc; padding: 10px;'>"
+            info_html += f"<h4>Vehicle {vehicle_id}</h4>"
+            
+            if vehicle_requests:
+                sorted_reqs = sorted(vehicle_requests, key=lambda r: r.get('requestedPickupAt') or datetime.fromtimestamp(0))
+                
+                info_html += f"<p><strong>Assigned Requests:</strong> {len(vehicle_requests)}</p>"
+                info_html += f"<p><strong>Route Distance:</strong> {route.get('distance', 0)/1000:.2f} km</p>"
+                info_html += f"<p><strong>Route Duration:</strong> {route.get('duration', 0)//60:.0f} minutes</p>"
+                
+                if route.get('fuel_consumption_liters'):
+                    info_html += f"<p><strong>Fuel:</strong> {route['fuel_consumption_liters']:.2f}L</p>"
+                    info_html += f"<p><strong>CO2:</strong> {route['co2_emissions_kg']:.2f}kg</p>"
+                
+                info_html += "<h5>Stop Sequence:</h5><ol>"
+                stop_number = 1
+                
+                for req in sorted_reqs:
+                    pickup_dt = req.get('requestedPickupAt')
+                    pickup_time = pickup_dt.strftime('%H:%M') if pickup_dt else 'N/A'
+                    
+                    info_html += f"<li>HOP ON - {req['originStopId']} (Request {req.get('requestId', 'N/A')}) at {pickup_time}</li>"
+                    info_html += f"<li>DROP OFF - {req['destStopId']} (Request {req.get('requestId', 'N/A')})</li>"
+                
+                info_html += "</ol>"
+                
+                # Time span info
+                if len(sorted_reqs) > 1:
+                    pickup_times = [r.get('requestedPickupAt') for r in sorted_reqs if r.get('requestedPickupAt')]
+                    if pickup_times:
+                        min_time = min(pickup_times)
+                        max_time = max(pickup_times)
+                        time_span = (max_time - min_time).total_seconds() / 60
+                        info_html += f"<p><strong>Time Span:</strong> {time_span:.1f} minutes</p>"
+                
+                info_html += f"<p><strong>Utilization:</strong> {len(sorted_reqs)}/{vehicle.get('capacity', 20)} capacity</p>"
+            else:
+                info_html += "<p>No requests assigned</p>"
+            
+            info_html += "</div>"
+        
+        return info_html
 
 def main():
     optimizer = DynamicRouteOptimizer('requests', 'stops', 'vehicles', 'MyRouteCalculator')

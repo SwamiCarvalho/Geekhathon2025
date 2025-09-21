@@ -16,7 +16,7 @@ def index():
         start_time = request.args.get('start')
         end_time = request.args.get('end')
         max_wait = int(request.args.get('maxwait', 15))
-        max_travel = int(request.args.get('maxtravel', 45))
+        max_travel = int(request.args.get('maxtravel', 20))
         
         print(f"Web request: start={start_time}, end={end_time}, maxwait={max_wait}, maxtravel={max_travel}")
         
@@ -49,7 +49,7 @@ def filter_routes():
     if start_time: params.append(f'start={start_time}')
     if end_time: params.append(f'end={end_time}')
     if max_wait != '15': params.append(f'maxwait={max_wait}')
-    if max_travel != '45': params.append(f'maxtravel={max_travel}')
+    if max_travel != '20': params.append(f'maxtravel={max_travel}')
     
     query_string = '&'.join(params)
     return redirect(f'/?{query_string}' if query_string else '/')
