@@ -456,7 +456,8 @@ Generate only the response text:`;
         parsedData.destStopId = destStops[0].stop_id;
         
         // Save to DynamoDB
-        const requestedPickupAt = `${parsedData.date} ${parsedData.time}:00`;
+        const timeToUse = parsedData.time && parsedData.time !== 'null' ? parsedData.time : currentTime;
+        const requestedPickupAt = `${parsedData.date} ${timeToUse}:00`;
         await saveBusRequest(originStops[0].stop_id, destStops[0].stop_id, requestedPickupAt);
         
         responseMessage = `✅ Bus request created!\nFrom: ${originStops[0].name}\nTo: ${destStops[0].name}\nPickup: ${parsedData.time}`;
@@ -507,7 +508,8 @@ Generate only the response text:`;
         parsedData.destStopId = exactDestMatch.stop_id;
         
         // Save to DynamoDB
-        const requestedPickupAt = `${parsedData.date} ${parsedData.time}:00`;
+        const timeToUse = parsedData.time && parsedData.time !== 'null' ? parsedData.time : currentTime;
+        const requestedPickupAt = `${parsedData.date} ${timeToUse}:00`;
         await saveBusRequest(exactOriginMatch.stop_id, exactDestMatch.stop_id, requestedPickupAt);
         
         responseMessage = `✅ Bus request created!\nFrom: ${exactOriginMatch.name}\nTo: ${exactDestMatch.name}\nPickup: ${parsedData.time}`;
