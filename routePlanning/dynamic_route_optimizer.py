@@ -41,17 +41,28 @@ class DynamicRouteOptimizer:
             for req in requests:
                 pickup_dt = req.get('requestedPickupAt')
                 if pickup_dt:
-                    # Only filter if both start and end times are provided
-                    if start_time and end_time:
-                        if pickup_dt >= start_time and pickup_dt <= end_time:
-                            filtered.append(req)
-                    elif start_time and pickup_dt >= start_time:
+                    include_request = True
+                    
+                    # Apply start time filter
+                    if start_time and pickup_dt < start_time:
+                        include_request = False
+                    
+                    # Apply end time filter
+                    if end_time and pickup_dt > end_time:
+                        include_request = False
+                    
+                    if include_request:
                         filtered.append(req)
-                    elif end_time and pickup_dt <= end_time:
+                else:
+                    # Include requests without pickup time if no filters
+                    if not start_time and not end_time:
                         filtered.append(req)
-                    elif not start_time and not end_time:
-                        filtered.append(req)
+            
             print(f"Filtered {len(filtered)} requests from {len(requests)} total requests")
+            print(f"Filter range: {start_time} to {end_time}")
+            if filtered:
+                sample_times = [req.get('requestedPickupAt') for req in filtered[:3]]
+                print(f"Sample filtered times: {sample_times}")
             return filtered
         
         return requests
@@ -197,7 +208,7 @@ class DynamicRouteOptimizer:
             print(f"Calling Lambda with {len(serialized_requests)} requests")
             
             response = self.lambda_client.invoke(
-                FunctionName='calculateRoutePy',
+                FunctionName='routeCalculatorPy',
                 InvocationType='RequestResponse',
                 Payload=json.dumps(payload)
             )
@@ -779,6 +790,10 @@ class DynamicRouteOptimizer:
                     start_time, end_time = end_time, start_time
                     start_datetime, end_datetime = end_datetime, start_datetime
                 print(f"Filtering requests from {start_datetime} to {end_datetime}")
+            elif start_time:
+                print(f"Filtering requests from {start_datetime} onwards")
+            elif end_time:
+                print(f"Filtering requests until {end_datetime}")
             
             print(f"Using max waiting time: {max_wait_minutes} minutes")
             print(f"Using max travel duration: {max_travel_minutes} minutes")
@@ -1036,26 +1051,35 @@ class DynamicRouteOptimizer:
         # Add pickups in time order
         for i, req in enumerate(sorted_requests):
             origin = self.get_stop_coords(req['originStopId'])
+            pickup_dt = req.get('requestedPickupAt')
+            pickup_time = pickup_dt.strftime('%H:%M') if pickup_dt else 'N/A'
+            
             if origin:
                 all_stops.append({
                     'type': 'pickup',
                     'requestId': req.get('requestId'),
                     'stopId': req['originStopId'],
+                    'time': pickup_time,
                     'coords': origin,
-                    'priority': i
+                    'pickup_order': i,
+                    'priority': pickup_dt.timestamp() if pickup_dt else 0
                 })
                 pickup_order[req.get('requestId')] = i
         
-        # Add dropoffs
+        # Add dropoffs with proper timing
         for req in sorted_requests:
             dest = self.get_stop_coords(req['destStopId'])
             if dest:
+                pickup_dt = req.get('requestedPickupAt')
+                dropoff_priority = (pickup_dt.timestamp() + 600) if pickup_dt else 999999  # 10 min after pickup
+                
                 all_stops.append({
                     'type': 'dropoff',
                     'requestId': req.get('requestId'),
                     'stopId': req['destStopId'],
                     'coords': dest,
-                    'priority': pickup_order.get(req.get('requestId'), 999) + 100
+                    'priority': dropoff_priority,
+                    'pickup_order': pickup_order.get(req.get('requestId'), 999)
                 })
         
         # Sort by priority
@@ -1080,22 +1104,53 @@ class DynamicRouteOptimizer:
                 IncludeLegGeometry=True
             )
             
+            # Calculate passenger journey times correctly
+            legs = response.get('Legs', [])
+            passenger_pickup_times = {}  # Track when each passenger was picked up
+            
+            cumulative_time = 0
+            for i, stop in enumerate(all_stops):
+                # Add travel time to reach this stop
+                if i > 0 and i-1 < len(legs):
+                    cumulative_time += legs[i-1].get('DurationSeconds', 0)
+                
+                if stop['type'] == 'pickup':
+                    passenger_pickup_times[stop['requestId']] = cumulative_time
+                    stop['cumulative_duration'] = cumulative_time
+                elif stop['type'] == 'dropoff':
+                    pickup_time = passenger_pickup_times.get(stop['requestId'], 0)
+                    journey_time = cumulative_time - pickup_time
+                    stop['cumulative_duration'] = cumulative_time
+                    stop['passenger_journey_time'] = max(journey_time, 0)  # Ensure non-negative
+            
+            # Calculate fuel efficiency metrics
+            total_distance_km = response['Summary']['Distance'] / 1000
+            fuel_consumption = total_distance_km * 0.08  # Assume 8L/100km
+            co2_emissions = fuel_consumption * 2.31  # kg CO2 per liter diesel
+            
             return {
                 'route': response['Legs'],
                 'distance': response['Summary']['Distance'],
                 'duration': response['Summary']['DurationSeconds'],
                 'waypoints': waypoints,
-                'sequence': all_stops
+                'sequence': all_stops,
+                'geometry': response.get('Legs', []),
+                'fuel_consumption_liters': round(fuel_consumption, 2),
+                'co2_emissions_kg': round(co2_emissions, 2),
+                'passengers_served': len(requests)
             }
             
         except Exception as e:
             print(f"Local route calculation failed: {e}")
             return {
-                'route': [],
-                'distance': 0,
-                'duration': 0,
-                'waypoints': waypoints,
-                'sequence': all_stops
+                'route': [], 
+                'distance': 0, 
+                'duration': 0, 
+                'waypoints': waypoints, 
+                'sequence': all_stops,
+                'fuel_consumption_liters': 0, 
+                'co2_emissions_kg': 0, 
+                'passengers_served': len(requests)
             }
     
     def _save_empty_map(self, m, filter_html, info_html, legend_html):

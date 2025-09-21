@@ -59,6 +59,7 @@ Return only the JSON object, no other text:`;
     const command = new InvokeModelCommand({
       modelId: "anthropic.claude-3-haiku-20240307-v1:0",
       body: JSON.stringify({
+        anthropic_version: "bedrock-2023-05-31",
         max_tokens: 200,
         messages: [{ role: "user", content: prompt }]
       }),
@@ -85,6 +86,7 @@ Return only the JSON object, no other text:`;
       }
     } catch (err) {
       console.error("Failed to parse Bedrock response:", err);
+      console.error("Raw response content:", responseBody);
       parsedData = { 
         origin: "Centro", 
         destination: "Estação", 
@@ -185,9 +187,10 @@ Return only the JSON object, no other text:`;
         });
         
         await lambdaClient.send(invokeCommand);
-        console.log('Route recalculation Lambda triggered');
+        console.log('Route recalculation Lambda triggered successfully');
       } catch (err) {
         console.error('Failed to trigger route recalculation Lambda:', err.message);
+        console.error('Error details:', err);
       }
       return requestId;
     }
