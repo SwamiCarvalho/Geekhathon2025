@@ -1,5 +1,6 @@
 import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
 import { DynamoDBClient, ScanCommand, PutItemCommand } from "@aws-sdk/client-dynamodb";
+import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 
 const bedrockClient = new BedrockRuntimeClient({ region: process.env.AWS_REGION || 'us-east-1' });
 
@@ -58,7 +59,6 @@ Return only the JSON object, no other text:`;
     const command = new InvokeModelCommand({
       modelId: "anthropic.claude-3-haiku-20240307-v1:0",
       body: JSON.stringify({
-        anthropic_version: "bedrock-2023-05-31",
         max_tokens: 200,
         messages: [{ role: "user", content: prompt }]
       }),
@@ -176,22 +176,18 @@ Return only the JSON object, no other text:`;
       await dynamoClient.send(putCommand);
       console.log(`Bus request saved with ID: ${requestId}`);
       
-      // Trigger route recalculation
+      // Trigger route recalculation via Lambda
       try {
-        const { spawn } = require('child_process');
-        const python = spawn('python', ['../routePlanning/dynamic_route_optimizer.py', 'recalculate']);
-        
-        python.stdout.on('data', (data) => {
-          console.log('Route optimizer output:', data.toString());
+        const lambdaClient = new LambdaClient({ region: process.env.AWS_REGION });
+        const invokeCommand = new InvokeCommand({
+          FunctionName: 'routeCalculatorPy',
+          InvocationType: 'Event' // Async invocation
         });
         
-        python.stderr.on('data', (data) => {
-          console.error('Route optimizer error:', data.toString());
-        });
-        
-        console.log('Route recalculation triggered');
+        await lambdaClient.send(invokeCommand);
+        console.log('Route recalculation Lambda triggered');
       } catch (err) {
-        console.error('Failed to trigger route recalculation:', err.message);
+        console.error('Failed to trigger route recalculation Lambda:', err.message);
       }
       return requestId;
     }

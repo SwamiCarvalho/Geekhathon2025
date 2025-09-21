@@ -15,6 +15,7 @@ class DynamicRouteOptimizer:
         self.vehicles_table = self.dynamodb.Table(vehicles_table)
         self.location_client = boto3.client('location')
         self.bedrock_client = boto3.client('bedrock-runtime')
+        self.lambda_client = boto3.client('lambda')
         self.map_name = map_name
         
     def get_requests(self, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> List[Dict[str, Any]]:
@@ -176,129 +177,62 @@ class DynamicRouteOptimizer:
         
         return total_cost
     
-
-    
-    def optimize_route_with_location_service(self, vehicle_id: str, requests: List[Dict]) -> Dict:
-        """Enhanced route optimization prioritizing dropoffs to minimize passenger travel time"""
-        if not requests:
-            return {'route': [], 'distance': 0, 'duration': 0}
-        
-        # Sort requests by pickup time
-        sorted_requests = sorted(requests, key=lambda r: r.get('requestedPickupAt') or datetime.fromtimestamp(0))
-        
-        # Create optimized stop sequence prioritizing dropoffs
-        all_stops = []
-        pickup_order = {}
-        
-        # First pass: add pickups in time order
-        for i, req in enumerate(sorted_requests):
-            origin = self.get_stop_coords(req['originStopId'])
-            pickup_dt = req.get('requestedPickupAt')
-            pickup_time = pickup_dt.strftime('%H:%M') if pickup_dt else 'N/A'
-            
-            if origin:
-                pickup_stop = {
-                    'type': 'pickup',
-                    'requestId': req.get('requestId'),
-                    'stopId': req['originStopId'],
-                    'time': pickup_time,
-                    'coords': origin,
-                    'pickup_order': i,
-                    'priority': pickup_dt.timestamp() if pickup_dt else 0
-                }
-                all_stops.append(pickup_stop)
-                pickup_order[req.get('requestId')] = i
-        
-        # Add all dropoffs with proper timing
-        for req in sorted_requests:
-            dest = self.get_stop_coords(req['destStopId'])
-            if dest:
-                pickup_dt = req.get('requestedPickupAt')
-                # Dropoff should be after pickup with reasonable travel time
-                dropoff_priority = (pickup_dt.timestamp() + 600) if pickup_dt else 999999  # 10 min after pickup
-                
-                dropoff_stop = {
-                    'type': 'dropoff',
-                    'requestId': req.get('requestId'),
-                    'stopId': req['destStopId'],
-                    'coords': dest,
-                    'priority': dropoff_priority,
-                    'pickup_order': pickup_order.get(req.get('requestId'), 999)
-                }
-                all_stops.append(dropoff_stop)
-        
-        # Sort all stops by priority (pickup time, then dropoff time)
-        all_stops.sort(key=lambda x: x['priority'])
-        
-        waypoints = [stop['coords'] for stop in all_stops]
-        sequence = all_stops
-        
-        if len(waypoints) < 2:
-            return {'route': [], 'distance': 0, 'duration': 0}
-        
-        # Ensure waypoint limit
-        if len(waypoints) > 23:
-            waypoints = waypoints[:23]
-            sequence = sequence[:23]
-        
+    def calculate_route_via_lambda(self, vehicle_id: str, requests: List[Dict]) -> Dict:
+        """Call route calculator Lambda to get optimized route"""
         try:
-            response = self.location_client.calculate_route(
-                CalculatorName=self.map_name,
-                DeparturePosition=waypoints[0],
-                DestinationPosition=waypoints[-1],
-                WaypointPositions=waypoints[1:-1] if len(waypoints) > 2 else [],
-                TravelMode='Car',
-                IncludeLegGeometry=True
+            # Convert datetime objects to strings for JSON serialization
+            serialized_requests = []
+            for req in requests:
+                req_copy = req.copy()
+                if 'requestedPickupAt' in req_copy and req_copy['requestedPickupAt']:
+                    if hasattr(req_copy['requestedPickupAt'], 'strftime'):
+                        req_copy['requestedPickupAt'] = req_copy['requestedPickupAt'].strftime('%Y-%m-%d %H:%M:%S')
+                serialized_requests.append(req_copy)
+            
+            payload = {
+                'vehicle_id': vehicle_id,
+                'requests': serialized_requests
+            }
+            
+            print(f"Calling Lambda with {len(serialized_requests)} requests")
+            
+            response = self.lambda_client.invoke(
+                FunctionName='calculateRoutePy',
+                InvocationType='RequestResponse',
+                Payload=json.dumps(payload)
             )
             
-            # Debug: Print response structure
-            print(f"Route response keys: {response.keys()}")
-            if 'Legs' in response and response['Legs']:
-                print(f"First leg keys: {response['Legs'][0].keys()}")
-                if 'Geometry' in response['Legs'][0]:
-                    print(f"Geometry keys: {response['Legs'][0]['Geometry'].keys()}")
+            result = json.loads(response['Payload'].read())
+            print(f"Raw Lambda response: {result}")
             
-            # Calculate passenger journey times correctly
-            legs = response.get('Legs', [])
-            passenger_pickup_times = {}  # Track when each passenger was picked up
-            
-            cumulative_time = 0
-            for i, stop in enumerate(sequence):
-                # Add travel time to reach this stop
-                if i > 0 and i-1 < len(legs):
-                    cumulative_time += legs[i-1].get('DurationSeconds', 0)
+            # Handle different response formats
+            if 'statusCode' in result:
+                if result['statusCode'] == 200:
+                    route_result = json.loads(result['body'])
+                    print(f"Route result keys: {list(route_result.keys())}")
+                    return route_result
+                else:
+                    print(f"Route calculation error: {result['body']}")
+                    return {'route': [], 'distance': 0, 'duration': 0}
+            elif 'errorType' in result:
+                # Lambda error (timeout, etc.)
+                print(f"Lambda error: {result['errorType']} - {result['errorMessage']}")
+                print("Falling back to local calculation")
+                return self._calculate_route_locally(vehicle_id, requests)
+            else:
+                # Direct response from Lambda (no API Gateway wrapper)
+                print(f"Direct Lambda response keys: {list(result.keys())}")
+                return result
                 
-                if stop['type'] == 'pickup':
-                    passenger_pickup_times[stop['requestId']] = cumulative_time
-                    stop['cumulative_duration'] = cumulative_time
-                elif stop['type'] == 'dropoff':
-                    pickup_time = passenger_pickup_times.get(stop['requestId'], 0)
-                    journey_time = cumulative_time - pickup_time
-                    stop['cumulative_duration'] = cumulative_time
-                    stop['passenger_journey_time'] = max(journey_time, 0)  # Ensure non-negative
-            
-            # Calculate fuel efficiency metrics
-            total_distance_km = response['Summary']['Distance'] / 1000
-            fuel_consumption = total_distance_km * 0.08  # Assume 8L/100km
-            co2_emissions = fuel_consumption * 2.31  # kg CO2 per liter diesel
-            
-            return {
-                'route': response['Legs'],
-                'distance': response['Summary']['Distance'],
-                'duration': response['Summary']['DurationSeconds'],
-                'waypoints': waypoints,
-                'sequence': sequence,
-                'geometry': response.get('Legs', []),
-                'fuel_consumption_liters': round(fuel_consumption, 2),
-                'co2_emissions_kg': round(co2_emissions, 2),
-                'passengers_served': len(requests)
-            }
         except Exception as e:
-            print(f"Route optimization failed: {e}")
-            return {
-                'route': [], 'distance': 0, 'duration': 0, 'waypoints': waypoints, 'sequence': sequence,
-                'fuel_consumption_liters': 0, 'co2_emissions_kg': 0, 'passengers_served': len(requests)
-            }
+            print(f"Failed to call route calculator Lambda: {e}")
+            print(f"Exception type: {type(e)}")
+            print("Falling back to local route calculation")
+            return self._calculate_route_locally(vehicle_id, requests)
+    
+    def optimize_route_with_location_service(self, vehicle_id: str, requests: List[Dict]) -> Dict:
+        """Use local route calculation (Lambda disabled due to timeout with large request sets)"""
+        return self._calculate_route_locally(vehicle_id, requests)
     
     def create_route_map(self, assignments: Dict[str, List[Dict]], routes: Dict[str, Dict], vehicles: List[Dict] = None) -> str:
         """Create interactive map with routes"""
@@ -312,11 +246,18 @@ class DynamicRouteOptimizer:
             
             colors = ['red', 'blue', 'green', 'purple', 'orange']
             print(f"Created base map centered at {center_lat}, {center_lon}")
+            print(f"Assignments: {[(k, len(v)) for k, v in assignments.items()]}")
+            print(f"Routes: {[(k, list(v.keys()) if v else 'None') for k, v in routes.items()]}")
             
             # Check if there are any assignments
             has_routes = any(len(reqs) > 0 for reqs in assignments.values())
             if not has_routes:
                 print("No routes to display - creating empty map")
+                # Create minimal HTML for empty map
+                filter_html = '<div>No routes found</div>'
+                info_html = '<div>No data</div>'
+                legend_html = '<div>No legend</div>'
+                return self._save_empty_map(m, filter_html, info_html, legend_html)
         except Exception as e:
             print(f"Error creating base map: {e}")
             raise
@@ -330,20 +271,24 @@ class DynamicRouteOptimizer:
             waypoints = route_data.get('waypoints', [])
             
             # Add vehicle marker
+            print(f"Vehicle {vehicle_id} has {len(waypoints)} waypoints")
             if waypoints:
                 folium.Marker(
                     [waypoints[0][1], waypoints[0][0]],
                     popup=f"Vehicle {vehicle_id}",
                     icon=folium.Icon(color=color, icon='car', prefix='fa')
                 ).add_to(m)
+            else:
+                print(f"No waypoints for vehicle {vehicle_id}")
             
             # Add route line using actual road geometry
             route_data = routes.get(vehicle_id, {})
             geometry_found = False
             
-            if route_data.get('geometry'):
+            # Check if we have route geometry from the Lambda response
+            if route_data.get('route'):
                 # Use actual route geometry from Amazon Location Service
-                for leg in route_data['geometry']:
+                for leg in route_data['route']:
                     if 'Geometry' in leg:
                         geometry = leg['Geometry']
                         if 'LineString' in geometry:
@@ -364,7 +309,7 @@ class DynamicRouteOptimizer:
             
             if not geometry_found and len(waypoints) > 1:
                 # Fallback to straight lines if no geometry available
-                print(f"Using fallback straight lines for vehicle {vehicle_id}")
+                print(f"Using fallback straight lines for vehicle {vehicle_id} with {len(waypoints)} waypoints")
                 route_coords = [[wp[1], wp[0]] for wp in waypoints]
                 folium.PolyLine(
                     route_coords,
@@ -374,10 +319,16 @@ class DynamicRouteOptimizer:
                     popup=f"Vehicle {vehicle_id} Route (Direct)",
                     dashArray='5, 5'
                 ).add_to(m)
+                geometry_found = True
+            
+            if not geometry_found:
+                print(f"No route found for vehicle {vehicle_id}")
             
             # Use optimized sequence from route data
             route_data = routes.get(vehicle_id, {})
+            print(f"Route data keys for {vehicle_id}: {list(route_data.keys()) if route_data else 'None'}")
             sequence = route_data.get('sequence', [])
+            print(f"Sequence for vehicle {vehicle_id}: {len(sequence)} stops")
             
             if sequence:
                 # Group stops by location to show multiple requests at same stop
@@ -823,6 +774,10 @@ class DynamicRouteOptimizer:
                     return {}, {}, None
             
             if start_time and end_time:
+                if start_time > end_time:
+                    print(f"Warning: Start time {start_datetime} is after end time {end_datetime}. Swapping dates.")
+                    start_time, end_time = end_time, start_time
+                    start_datetime, end_datetime = end_datetime, start_datetime
                 print(f"Filtering requests from {start_datetime} to {end_datetime}")
             
             print(f"Using max waiting time: {max_wait_minutes} minutes")
@@ -845,7 +800,7 @@ class DynamicRouteOptimizer:
             
             if not requests:
                 print("No requests found! Creating empty map.")
-                # Create empty map when no requests found
+                # Create empty map when no requests found - no Lambda calls needed
                 try:
                     empty_assignments = {vehicle['vehicleId']: [] for vehicle in vehicles}
                     map_file = self.create_route_map(empty_assignments, {}, vehicles)
@@ -862,20 +817,27 @@ class DynamicRouteOptimizer:
             try:
                 assignments = self.assign_requests_to_vehicles(requests, vehicles, max_wait_minutes, max_travel_minutes)
                 print(f"Successfully assigned requests to vehicles")
+                print(f"Assignment summary: {[(k, len(v)) for k, v in assignments.items()]}")
             except Exception as e:
                 print(f"Error assigning requests to vehicles: {e}")
                 return {}, {}, None
             
-            # Optimize routes for each vehicle
+            # Optimize routes for each vehicle - only call Lambda if there are requests
             routes = {}
+            vehicles_with_requests = [(k, v) for k, v in assignments.items() if v]
+            print(f"Vehicles with requests: {len(vehicles_with_requests)}")
+            
             for vehicle_id, vehicle_requests in assignments.items():
                 if vehicle_requests:
                     try:
+                        print(f"Calling Lambda for vehicle {vehicle_id} with {len(vehicle_requests)} requests")
                         routes[vehicle_id] = self.optimize_route_with_location_service(vehicle_id, vehicle_requests)
                         print(f"Successfully optimized route for vehicle {vehicle_id}")
                     except Exception as e:
                         print(f"Error optimizing route for vehicle {vehicle_id}: {e}")
                         routes[vehicle_id] = {'route': [], 'distance': 0, 'duration': 0}
+                else:
+                    print(f"No requests for vehicle {vehicle_id} - skipping Lambda call")
             
             # Create map
             try:
@@ -1058,6 +1020,100 @@ class DynamicRouteOptimizer:
             info_html += "</div>"
         
         return info_html
+    
+    def _calculate_route_locally(self, vehicle_id: str, requests: List[Dict]) -> Dict:
+        """Fallback local route calculation when Lambda fails"""
+        if not requests:
+            return {'route': [], 'distance': 0, 'duration': 0, 'waypoints': [], 'sequence': []}
+        
+        # Sort requests by pickup time
+        sorted_requests = sorted(requests, key=lambda r: r.get('requestedPickupAt', ''))
+        
+        # Create stop sequence
+        all_stops = []
+        pickup_order = {}
+        
+        # Add pickups in time order
+        for i, req in enumerate(sorted_requests):
+            origin = self.get_stop_coords(req['originStopId'])
+            if origin:
+                all_stops.append({
+                    'type': 'pickup',
+                    'requestId': req.get('requestId'),
+                    'stopId': req['originStopId'],
+                    'coords': origin,
+                    'priority': i
+                })
+                pickup_order[req.get('requestId')] = i
+        
+        # Add dropoffs
+        for req in sorted_requests:
+            dest = self.get_stop_coords(req['destStopId'])
+            if dest:
+                all_stops.append({
+                    'type': 'dropoff',
+                    'requestId': req.get('requestId'),
+                    'stopId': req['destStopId'],
+                    'coords': dest,
+                    'priority': pickup_order.get(req.get('requestId'), 999) + 100
+                })
+        
+        # Sort by priority
+        all_stops.sort(key=lambda x: x['priority'])
+        waypoints = [stop['coords'] for stop in all_stops]
+        
+        if len(waypoints) < 2:
+            return {'route': [], 'distance': 0, 'duration': 0, 'waypoints': waypoints, 'sequence': all_stops}
+        
+        # Limit waypoints
+        if len(waypoints) > 23:
+            waypoints = waypoints[:23]
+            all_stops = all_stops[:23]
+        
+        try:
+            response = self.location_client.calculate_route(
+                CalculatorName=self.map_name,
+                DeparturePosition=waypoints[0],
+                DestinationPosition=waypoints[-1],
+                WaypointPositions=waypoints[1:-1] if len(waypoints) > 2 else [],
+                TravelMode='Car',
+                IncludeLegGeometry=True
+            )
+            
+            return {
+                'route': response['Legs'],
+                'distance': response['Summary']['Distance'],
+                'duration': response['Summary']['DurationSeconds'],
+                'waypoints': waypoints,
+                'sequence': all_stops
+            }
+            
+        except Exception as e:
+            print(f"Local route calculation failed: {e}")
+            return {
+                'route': [],
+                'distance': 0,
+                'duration': 0,
+                'waypoints': waypoints,
+                'sequence': all_stops
+            }
+    
+    def _save_empty_map(self, m, filter_html, info_html, legend_html):
+        """Save empty map without processing routes"""
+        try:
+            map_var = f"map_{int(time.time())}"
+            filter_html = filter_html.replace(f"map_{int(time.time())}", map_var)
+            m.get_root().html.add_child(folium.Element(filter_html))
+            m.get_root().html.add_child(folium.Element(info_html))
+            m.get_root().html.add_child(folium.Element(legend_html))
+            
+            map_file = f"route_map_{int(time.time())}.html"
+            m.save(map_file)
+            print(f"Empty map saved as: {map_file}")
+            return map_file
+        except Exception as e:
+            print(f"Error saving empty map: {e}")
+            return None
 
 def main():
     optimizer = DynamicRouteOptimizer('requests', 'stops', 'vehicles', 'MyRouteCalculator')
